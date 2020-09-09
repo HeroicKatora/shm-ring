@@ -106,6 +106,18 @@ pub struct QueueHead {
     half_b: QueueHalf,
 }
 
+/// A reader from a queue.
+pub struct ReadHalf<'queue> {
+    inner: &'queue QueueHalf,
+    buffer: &'queue cell::UnsafeCell<[u8]>,
+}
+
+/// A reader from a queue.
+pub struct WriteHalf<'queue> {
+    inner: &'queue QueueHalf,
+    buffer: &'queue cell::UnsafeCell<[u8]>,
+}
+
 #[repr(C)]
 pub struct QueueHalf {
     /// First futex that the threads may use.
@@ -153,10 +165,15 @@ pub struct ShmClient {
 }
 
 /// A single queue in the ring.
+/// IMPORTANT: This is an owning structure of this half of the queue, which is a safety
+/// invariant. You must not call methods other than `reverse` on the half you do not own. Otherwise
+/// the read or write buffer might be out-of-sync of the synchronized range of bytes in the
+/// respective queues.
 struct ShmQueues {
     private_head: ptr::NonNull<QueueHead>,
     private_queues: ptr::NonNull<u64>,
     private_mem: ptr::NonNull<u8>,
+    is_a_side: bool,
 }
 
 /// An active connection to another client (or the controller).
@@ -274,7 +291,19 @@ impl ShmController {
     /// Handle a round of messages.
     /// Will never block but might take a while?
     pub fn enter(&self) {
-        // TODO:
+        self.handle_new_client();
+        self.handle_client_queues();
+    }
+
+    fn handle_new_client(&self) {
+    }
+
+    fn handle_client_queues(&self) {
+        let clients = self.monitor().members.load(Ordering::Relaxed);
+        for i in 0..clients {
+            let queue = self.heads.queues_controller(i);
+            control::ControlMessage::execute(self, queue);
+        }
     }
 
     pub(crate) fn monitor(&self) -> &MonitorHead {
@@ -298,32 +327,20 @@ impl ShmClient {
         }
 
         let pid = os_impl::own_pid();
-        let this = self.find_open_client(pid)?;
+        let want = self.find_open_client(pid)?;
 
         let queue = match self.join_with {
             JoinMethod::Pipe | JoinMethod::Semaphore => {
-                self.nicely_rescind_client(this, pid);
+                self.nicely_rescind_client(want, pid);
                 return Err(ConnectError);
             },
-            JoinMethod::Futex => os_impl::futex(&self, this),
+            JoinMethod::Futex => os_impl::futex(&self, want),
         };
 
         let this = queue?;
-        let (private_head, private_queues, private_mem);
-        // FIXME: validated pointers? We trust the server but it's a precaution against
-        // alternative implementations that are wrong..
-        private_head = self.heads.head_start(this);
-        private_queues = self.heads.queue_start(this);
-        private_mem = self.heads.heap_start(this);
-
-        let queues = ShmQueues {
-            private_head,
-            private_queues,
-            private_mem,
-        };
 
         let ring = ShmRing {
-            queues,
+            queues: self.heads.queues_controller(this).reverse(),
             shared: self.shared,
             heads: self.heads,
         };
@@ -461,6 +478,220 @@ impl ShmHeads {
 
         unsafe {
             ptr::NonNull::new(base.add(start).add(offset)).unwrap()
+        }
+    }
+
+    /// FIXME: should we make this unsafe just because?
+    fn queues_controller(&self, this: u32) -> ShmQueues {
+        let (private_head, private_queues, private_mem);
+        // FIXME: validated pointers? We trust the server but it's a precaution against
+        // alternative implementations that are wrong..
+        private_head = self.head_start(this);
+        private_queues = self.queue_start(this);
+        private_mem = self.heap_start(this);
+
+        ShmQueues {
+            private_head,
+            private_queues,
+            private_mem,
+            is_a_side: true,
+        }
+    }
+}
+
+impl ShmQueues {
+    fn reverse(self) -> Self {
+        ShmQueues {
+            is_a_side: !self.is_a_side,
+            ..self
+        }
+    }
+
+    fn half_to_read_from(&mut self) -> ReadHalf<'_> {
+        let queue = unsafe { &*self.private_head.as_ptr() };
+        let (inner, offset) = if self.is_a_side {
+            (&queue.half_b, OpenOptions::PAGE_SIZE)
+        } else {
+            (&queue.half_a, 0)
+        };
+        let buffer = unsafe {
+            let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
+            let buffer = ptr::slice_from_raw_parts(addr, OpenOptions::PAGE_SIZE);
+            &*(buffer as *const cell::UnsafeCell<[u8]>)
+        };
+        ReadHalf {
+            inner,
+            buffer,
+        }
+    }
+
+    fn half_to_write_to(&mut self) -> WriteHalf<'_> {
+        let queue = unsafe { &*self.private_head.as_ptr() };
+        let (inner, offset) = if self.is_a_side {
+            (&queue.half_a, 0)
+        } else {
+            (&queue.half_b, OpenOptions::PAGE_SIZE)
+        };
+        let buffer = unsafe {
+            let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
+            let buffer = ptr::slice_from_raw_parts(addr, OpenOptions::PAGE_SIZE);
+            &*(buffer as *const cell::UnsafeCell<[u8]>)
+        };
+        WriteHalf {
+            inner,
+            buffer,
+        }
+    }
+}
+
+struct PreparedRead<'buffer> {
+    commit: &'buffer AtomicU32,
+    unwrapped: &'buffer [u8],
+    wrapped: &'buffer [u8],
+    read_base: u32,
+    read_end: u32,
+}
+
+struct PreparedWrite<'buffer> {
+    commit: &'buffer AtomicU32,
+    unwrapped: &'buffer mut [u8],
+    wrapped: &'buffer mut [u8],
+    write_base: u32,
+    write_end: u32,
+}
+
+impl ReadHalf<'_> {
+    /// Return (reader, ready) if it is at least count bytes.
+    fn acquire_ready(&self, count: u32) -> Option<(u32, u32)> {
+        // On success we must have read with Acquire to sync the buffer contents.
+        let writer = self.inner.write_head.load(Ordering::Acquire);
+        // But not this, this is published by us..
+        let reader = self.inner.read_head.load(Ordering::Relaxed);
+        let modulo = OpenOptions::PAGE_SIZE as u32;
+
+        let ready = ((writer + modulo) - reader) % modulo;
+        if ready < count {
+            None
+        } else {
+            Some((reader, ready))
+        }
+    }
+
+    fn available(&mut self, count: u32) -> Option<PreparedRead<'_>> {
+        let (reader, ready) = self.acquire_ready(count)?;
+        let modulo = OpenOptions::PAGE_SIZE as u32;
+
+        let norm_half = (reader + ready).min(modulo);
+        let wrap_half = (reader + ready).max(modulo) - modulo;
+
+        let buffer = self.buffer.get() as *const u8;
+
+        // SAFETY: synchronized as required. The other thread has release this.
+        let (first, wrapped) = unsafe {
+            let norm = &*slice::from_raw_parts(buffer.add(reader as usize), norm_half as usize);
+            let wrapping = &*slice::from_raw_parts(buffer, wrap_half as usize);
+            (norm, wrapping)
+        };
+        Some(PreparedRead {
+            commit: &self.inner.read_head,
+            read_base: reader,
+            read_end: (reader + ready) % modulo,
+            unwrapped: first,
+            wrapped,
+        })
+    }
+}
+
+impl PreparedRead<'_> {
+    /// Atomically remove one value.
+    fn controller_u64(&self) -> u64 {
+        let bh = self.unwrapped;
+        let lh = self.wrapped;
+
+        // We only ever dequeue 64 at once..
+        assert!(bh.is_empty() || lh.is_empty());
+        assert_eq!(bh.len() + lh.len(), 8);
+        let bh = <[u8; 8]>::try_from(bh);
+        let lh = <[u8; 8]>::try_from(lh);
+        let val = bh.or(lh).expect("logic bug");
+        u64::from_be_bytes(val)
+    }
+
+    fn commit(self) {
+        if cfg!(debug_assertions) {
+            let must_succeed = self.commit.compare_exchange(
+                self.read_base, self.read_end, Ordering::Release, Ordering::Relaxed);
+            must_succeed.expect("Another thread accessed supposedly owned read head");
+        } else {
+            self.commit.store(self.read_end, Ordering::Release);
+        }
+    }
+}
+
+impl WriteHalf<'_> {
+    /// Return (reader, ready) if it is at least count bytes.
+    fn acquire_ready(&self, count: u32) -> Option<(u32, u32)> {
+        // The write head is owned by us, don't care a lot.
+        let writer = self.inner.write_head.load(Ordering::Relaxed);
+        // But not this, we must not touch entries that are still being read.
+        let reader = self.inner.read_head.load(Ordering::Acquire);
+        let modulo = OpenOptions::PAGE_SIZE as u32;
+
+        let empty = ((reader + modulo) - writer) % modulo;
+        if empty <= count { // Strict, new end must be smaller than reader.
+            None
+        } else {
+            Some((writer, empty))
+        }
+    }
+
+    fn prepare_write(&mut self, count: u32) -> Option<PreparedWrite<'_>> {
+        let (writer, empty) = self.acquire_ready(count)?;
+        let modulo = OpenOptions::PAGE_SIZE as u32;
+
+        let norm_half = (writer + empty).min(modulo);
+        let wrap_half = (writer + empty).max(modulo) - modulo;
+
+        let buffer = self.buffer.get() as *mut u8;
+
+        // SAFETY: synchronized as required. The other thread has release this.
+        let (first, wrapped) = unsafe {
+            let norm = &mut *slice::from_raw_parts_mut(buffer.add(writer as usize), norm_half as usize);
+            let wrapping = &mut *slice::from_raw_parts_mut(buffer, wrap_half as usize);
+            (norm, wrapping)
+        };
+        Some(PreparedWrite {
+            commit: &self.inner.read_head,
+            write_base: writer,
+            write_end: (writer + empty) % modulo,
+            unwrapped: first,
+            wrapped,
+        })
+    }
+}
+
+impl PreparedWrite<'_> {
+    /// Atomically remove one value.
+    fn controller_u64(&mut self, val: u64) {
+        let bh = &mut *self.unwrapped;
+        let lh = &mut *self.wrapped;
+
+        // We only ever dequeue 64 at once..
+        assert!(bh.is_empty() || lh.is_empty());
+        assert_eq!(bh.len() + lh.len(), 8);
+        let val = u64::to_be_bytes(val);
+        let bh = <&mut [u8; 8]>::try_from(bh);
+        let lh = <&mut [u8; 8]>::try_from(lh);
+        let buf = bh.or(lh).expect("logic bug");
+        *buf = val;
+    }
+    fn commit(self) {
+        if cfg!(debug_assertions) {
+            let must_succeed = self.commit.compare_exchange(
+                self.write_base, self.write_end, Ordering::Release, Ordering::Relaxed);
+            must_succeed.expect("Another thread accessed supposedly owned write head");
+        } else {
+            self.commit.store(self.write_end, Ordering::Release);
         }
     }
 }
