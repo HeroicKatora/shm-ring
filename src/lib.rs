@@ -216,17 +216,55 @@ pub struct OpenError;
 pub struct SendError;
 #[derive(Debug)]
 pub struct RecvError;
+#[derive(Debug)]
+pub struct OptionsError;
 
 impl OpenOptions {
     const PAGE_SIZE: usize = 4096;
     // TODO: do we want a useful magic before release?
     const MAGIC: u32 = 0x9d14_c252;
+    const RINGS_MAX: u32 = 4096;
+    const MEMBERS_MAX: u32 = 4096;
 
     pub fn new() -> Self {
         OpenOptions {
             num_rings: 64,
             max_members: 32,
         }
+    }
+
+    /// Configure the number of rings.
+    ///
+    /// The member count must be not be larger than the new number of rings to allocate and the
+    /// ring count must not exceed a constant limit.
+    pub fn with_rings(mut self, rings: u32) -> Result<Self, OptionsError> {
+        if rings >= Self::RINGS_MAX {
+            return Err(OptionsError);
+        }
+
+        if rings < self.max_members {
+            return Err(OptionsError);
+        }
+
+        self.num_rings = rings;
+        Ok(self)
+    }
+
+    /// Configure the number of maximum members.
+    ///
+    /// The new member count must be not be larger than the number of rings to allocate and not
+    /// exceed a constant limit.
+    pub fn with_members(mut self, members: u32) -> Result<Self, OptionsError> {
+        if members >= Self::MEMBERS_MAX {
+            return Err(OptionsError);
+        }
+
+        if self.num_rings < members {
+            return Err(OptionsError);
+        }
+
+        self.max_members = members;
+        Ok(self)
     }
 
     pub fn open(self, path: &std::path::Path) -> Result<ShmClient, shared_memory::ShmemError> {
@@ -254,13 +292,14 @@ impl OpenOptions {
         assert!(self.max_members <= self.num_rings, "At least one ring per potential member is required");
         let pages = self.num_rings as usize * 5 + 3;
         let size = pages * Self::PAGE_SIZE;
-        let shared = shared_memory::ShmemConf::new()
+        let mut shared = shared_memory::ShmemConf::new()
             .flink(path)
             // Three pages for the controller: head, open, free
             // Five pages per ring (one head, 2 for commands, 2 buffers)
             .size(size)
             .create()?;
         assert!(shared.len() >= size);
+        shared.set_owner(true);
         let (monitor, open);
         unsafe {
             monitor = ptr::NonNull::new(shared.as_ptr()).unwrap();
@@ -339,7 +378,7 @@ impl ShmController {
         });
     }
 
-    fn handle_client_queues(&self) {
+    fn handle_client_queues(&mut self) {
         let clients = self.monitor().max_members.load(Ordering::Relaxed);
         for i in 0..clients {
             let queue = self.heads.queues_controller(i);
@@ -361,7 +400,7 @@ impl ShmController {
 }
 
 impl ControllerState {
-    fn new(config: &OpenOptions, heads: &ShmHeads) -> Box<Self> {
+    fn new(config: &OpenOptions, _: &ShmHeads) -> Box<Self> {
         Box::new(ControllerState {
             free_queues: (config.max_members..config.num_rings).collect(),
         })

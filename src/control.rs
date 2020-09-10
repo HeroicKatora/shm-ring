@@ -69,12 +69,12 @@ pub struct Ping {
 impl Cmd {
     pub const BAD: Self = Cmd(!0);
     pub const UNIMPLEMENTED: Self = Cmd(!0 - 1);
+    pub const OUT_OF_QUEUES: Self = Cmd(!0 - 2);
     pub const REQUEST_NEW_RING: Self = Cmd(1);
     pub const REQUEST_PING: Self = Cmd(2);
 }
 
 impl ControlMessage {
-
     /// Create a new message.
     ///
     /// Exists for document purposes, see the list of implementors of `Into` and `From`.
@@ -86,6 +86,10 @@ impl ControlMessage {
         ControlMessage {
             op: u64::from(op) << 16 | u64::from(tag)
         }
+    }
+
+    fn with_result(self, val: u32) -> Self {
+        ControlMessage { op: self.op | u64::from(val) << 32 }
     }
 
     fn tag(self) -> Tag {
@@ -111,7 +115,7 @@ impl From<Ping> for ControlMessage {
 
 /// Private implementation of commands.
 impl ControlMessage {
-    pub(crate) fn execute(controller: &ShmController, mut queue: ShmQueues) {
+    pub(crate) fn execute(controller: &mut ShmController, mut queue: ShmQueues) {
         if queue.half_to_write_to().prepare_write(8).is_none() {
             // No space for response. Don't.
             return;
@@ -123,6 +127,8 @@ impl ControlMessage {
             let msg = ControlMessage { op };
             let tag = msg.tag();
             let cmd = msg.cmd();
+
+            let mut result = 0;
             let (mut op, extra_space);
             match cmd {
                 Cmd::REQUEST_PING => {
@@ -130,7 +136,14 @@ impl ControlMessage {
                     extra_space = 0;
                 }
                 _ => {
-                    op = Cmd::UNIMPLEMENTED;
+                    let queues = &mut controller.state.free_queues;
+                    if let Some(queue) = queues.pop() {
+                        op = Cmd::REQUEST_NEW_RING;
+                        result = queue;
+                    } else {
+                        op = Cmd::OUT_OF_QUEUES;
+                    }
+
                     extra_space = 0;
                 }
             };
@@ -140,7 +153,7 @@ impl ControlMessage {
             // At this point, commit to writing a result.
             available.commit();
 
-            let answer = ControlMessage::with_raw(op, tag);
+            let answer = ControlMessage::with_raw(op, tag).with_result(result);
             let mut writer = queue.half_to_write_to();
             let mut write = writer.prepare_write(8).unwrap();
             write.controller_u64(answer.op);
