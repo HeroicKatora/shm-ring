@@ -1,4 +1,4 @@
-use super::{ConnectError, ShmClient};
+use super::{ConnectError, ShmClient, ShmController};
 
 use core::sync::atomic::Ordering;
 use linux_futex::{AsFutex, Futex, Shared, WaitError};
@@ -9,16 +9,20 @@ pub fn own_pid() -> u64 {
 
 pub fn futex(client: &ShmClient, this: u32) -> Result<u32, ConnectError> {
     let open = client.open();
+    let open = &open.futex;
 
-    let futex: &Futex<Shared> = open.futex.as_futex();
-    while let Err(err) = futex.value.compare_exchange(0, this as i32, Ordering::Relaxed, Ordering::Relaxed) {
+    while let Err(err) = open.compare_exchange(-1, this as i32, Ordering::AcqRel, Ordering::Relaxed) {
+        println!("{}", err);
+        let futex: &Futex<Shared> = open.as_futex();
         futex.wake(1);
         // Shortly wait for this to clear. Never mind if it did already.
         let _ = futex.wait(err);
     }
 
+    println!("Waiting @{}", this);
+
     loop {
-        match futex.wait(this as i32) {
+        match (open.as_futex() as &Futex<Shared>).wait(this as i32) {
             // If someone else updated before we woke, we might have a wrong value but succeeded.
             Ok(()) | Err(WaitError::WrongValue) => break,
             Err(WaitError::Interrupted) => {},
@@ -27,4 +31,23 @@ pub fn futex(client: &ShmClient, this: u32) -> Result<u32, ConnectError> {
 
     // Queues are ID mapped for clients..
     Ok(this)
+}
+
+pub fn join_futex(server: &ShmController, transaction: impl FnOnce(u32)) {
+    let join_futex = &server.open().futex;
+    let request = join_futex.load(Ordering::Acquire) as u32;
+    println!("{}", request);
+    if request < server.monitor().max_members.load(Ordering::Relaxed) {
+        // We must reset the queue. Assumes there is no current user here. The old secondary
+        // was apparently gone and we would be the primary.
+        transaction(request);
+
+        // Now release that state, queue is ready.
+        join_futex.store(-1, Ordering::Release);
+        (join_futex.as_futex() as &Futex<Shared>).wake(1);
+    } else if request != 0 {
+        // No idea what that was but reset so that other clients can signal.
+        join_futex.store(-1, Ordering::Release);
+        (join_futex.as_futex() as &Futex<Shared>).wake(1);
+    }
 }

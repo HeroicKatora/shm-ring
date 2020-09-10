@@ -3,15 +3,25 @@ use std::path::Path;
 use shm_ring;
 
 fn main() {
-    let mut client = shm_ring::OpenOptions::new()
+    let client = shm_ring::OpenOptions::new()
         .open(Path::new("server"))
         .unwrap();
 
-    let mut server = client.connect().unwrap();
+    println!("[.] Allowed methods: {}", client.raw_join_methods());
+    println!("[.] Members (now, max): {:?}", client.members());
+
+    let mut server = client
+        .join_with(shm_ring::JoinMethod::Futex)
+        .connect()
+        .unwrap();
+    println!("[+] Joined");
+
     // TODO: setup accepting echo rings..
     server.request(shm_ring::control::RequestNewRing {
         payload: Default::default() 
     }).unwrap();
+
+    println!("[+] Request has been sent");
 
     let listen = loop {
         match {
@@ -27,6 +37,8 @@ fn main() {
             Ok(Some(id)) => break id,
         }
     };
+
+    println!("[+] Granted {}", listen);
 
     loop {
         // TODO: echo back all bytes received on the control ring

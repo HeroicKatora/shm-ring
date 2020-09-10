@@ -58,6 +58,7 @@ pub const MEMBER_LIMIT: usize = 256;
 /// The monitor head is _only_ written by the controller.
 #[repr(C)]
 pub struct MonitorHead {
+    magic: AtomicU32,
     /// Static version of this header structure.
     version: AtomicU32,
     /// A bit-mask of available methods for opening a new handle.
@@ -212,6 +213,8 @@ pub struct RecvError;
 
 impl OpenOptions {
     const PAGE_SIZE: usize = 4096;
+    // TODO: do we want a useful magic before release?
+    const MAGIC: u32 = 0x9d14_c252;
 
     pub fn new() -> Self {
         OpenOptions {
@@ -229,6 +232,10 @@ impl OpenOptions {
         let heads = unsafe {
             ShmHeads::from_monitor(head.cast())
         }.map_err(|_| shared_memory::ShmemError::MapSizeZero)?;
+
+        if heads.monitor().magic.load(Ordering::Acquire) != OpenOptions::MAGIC {
+            return Err(shared_memory::ShmemError::MapSizeZero);
+        }
 
         Ok(ShmClient {
             shared,
@@ -264,6 +271,7 @@ impl OpenOptions {
 
         // Init sequence: write static information and lastly write the open_with information
         let monitor = controller.monitor();
+        monitor.magic.store(OpenOptions::MAGIC, Ordering::Release);
         monitor.version.store(1, Ordering::Release);
         monitor.open_page.store(Self::PAGE_SIZE as u64, Ordering::Release);
         let first_head = 3;
@@ -278,9 +286,12 @@ impl OpenOptions {
         // For now, starts directly behind head.
         let member_list_start = u64::try_from(mem::size_of::<MonitorHead>()).unwrap();
         monitor.member_list.store(member_list_start, Ordering::Release);
+        assert_eq!(controller.member_list().len(), self.max_members as usize);
         for member in controller.member_list() {
             member.store(0, Ordering::Release);
         }
+
+        controller.open().futex.store(-1, Ordering::Release);
 
         // Enable futex based join.
         // TODO: can't do that on all systems.
@@ -295,6 +306,14 @@ impl ShmController {
         self.shared.get_flink_path().unwrap()
     }
 
+    pub fn raw_join_methods(&self) -> u32 {
+        self.monitor().open_with.load(Ordering::Relaxed)
+    }
+
+    pub fn members(&self) -> (u32, u32) {
+        self.monitor().members()
+    }
+
     /// Handle a round of messages.
     /// Will never block but might take a while?
     pub fn enter(&mut self) {
@@ -303,19 +322,9 @@ impl ShmController {
     }
 
     fn handle_new_client(&self) {
-        let join_futex = &self.open().futex;
-        let request = join_futex.load(Ordering::Acquire) as u32;
-        if request < self.monitor().max_members.load(Ordering::Relaxed) {
-            // We must reset the queue. Assumes there is no current user here. The old secondary
-            // was apparently gone and we would be the primary.
+        os_impl::join_futex(self, |request| {
             self.heads.queues_controller(request).reset();
-
-            // Now release that state, queue is ready.
-            join_futex.store(0, Ordering::Release);
-        } else if request != 0 {
-            // No idea what that was but reset so that other clients can signal.
-            join_futex.store(0, Ordering::Release);
-        }
+        });
     }
 
     fn handle_client_queues(&self) {
@@ -340,14 +349,29 @@ impl ShmController {
 }
 
 impl ShmClient {
+    pub fn raw_join_methods(&self) -> u32 {
+        self.monitor().open_with.load(Ordering::Relaxed)
+    }
+
+    pub fn members(&self) -> (u32, u32) {
+        self.monitor().members()
+    }
+
+    pub fn join_with(mut self, method: JoinMethod) -> Self {
+        self.join_with = method;
+        self
+    }
+
     pub fn connect(self) -> Result<ShmControllerRing, ConnectError> {
-        let allowed = self.monitor().open_with.load(Ordering::Relaxed);
+        let allowed = self.monitor().open_with.load(Ordering::Acquire);
+
         if self.join_with.as_u32() & allowed == 0 {
             return Err(ConnectError);
         }
 
         let pid = os_impl::own_pid();
         let want = self.find_open_client(pid)?;
+        println!("{}@{}", pid, want);
 
         let queue = match self.join_with {
             JoinMethod::Pipe | JoinMethod::Semaphore => {
@@ -390,7 +414,7 @@ impl ShmClient {
 
         loop {
             for (idx, c) in clients.iter().enumerate() {
-                match c.compare_exchange(0, pid, Ordering::Acquire, Ordering::Relaxed) {
+                match c.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed) {
                     Ok(_) => return Ok(idx as u32),
                     Err(_) => {},
                 }
@@ -562,6 +586,14 @@ impl ShmHeads {
             private_mem,
             is_a_side: true,
         }
+    }
+}
+
+impl MonitorHead {
+    pub fn members(&self) -> (u32, u32) {
+        let now = self.members.load(Ordering::Acquire);
+        let max = self.max_members.load(Ordering::Acquire);
+        (now, max)
     }
 }
 
