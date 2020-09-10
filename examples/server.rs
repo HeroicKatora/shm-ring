@@ -1,6 +1,6 @@
 /// An echo server attaching itself to a controller.
 use std::path::Path;
-use shm_ring;
+use shm_ring::{self, control::Cmd};
 
 fn main() {
     let client = shm_ring::OpenOptions::new()
@@ -23,11 +23,11 @@ fn main() {
 
     println!("[+] Request has been sent");
 
-    let listen = loop {
+    let (kind, listen) = loop {
         match {
             server.response(|response| {
-                if let shm_ring::control::Tag(0) = response.payload() {
-                    Some(response.operation())
+                if let shm_ring::control::Tag(0) = response.tag() {
+                    Some((response.response(), response.value0()))
                 } else {
                     None
                 }
@@ -38,12 +38,12 @@ fn main() {
         }
     };
 
-    if listen == u32::MAX {
+    if kind == Cmd::BAD {
         println!("[-] Bad request?");
         std::process::exit(1);
     }
 
-    if listen == u32::MAX - 1 {
+    if kind == Cmd::UNIMPLEMENTED {
         println!("[-] Unimplemented?");
         std::process::exit(1);
     }

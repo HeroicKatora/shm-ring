@@ -39,6 +39,7 @@
 //! assume and mustn't violate them. Otherwise it could, for example, at a later point in time
 //! resume and unwillingly interfere with another thread that took its place. The second case can
 //! be resolved more forcefully but may be different (harder?) to detect.
+mod atomic;
 pub mod control;
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
@@ -95,7 +96,7 @@ pub struct MonitorOpen {
     tid_semaphore: u64,
     /// Futex to wait on for global control operations such as join.
     futex: AtomicI32,
-    _align_futex: u32, // Filler.
+    _align_futex: u32, // Filler. Unused.
 }
 
 /// A queue between two threads.

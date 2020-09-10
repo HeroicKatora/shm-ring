@@ -26,8 +26,8 @@ fn main() {
     loop {
         match {
             connection.response(|response| {
-                shm_ring::control::Tag(0x42) == response.payload() && {
-                    assert_eq!(response.operation(), shm_ring::control::ControlMessage::REQUEST_PING);
+                shm_ring::control::Tag(0x42) == response.tag() && {
+                    assert_eq!(response.response(), shm_ring::control::Cmd::REQUEST_PING);
                     true
                 }
             })

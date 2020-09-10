@@ -1,12 +1,45 @@
 use super::{ReadHalf, ShmController, ShmQueues};
 
-/// A tag is a payload that will be returned as part of the response.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct Tag(pub u32);
+/// A tag is an identifier for a pending request.
+///
+/// The command server has no internal buffer so this should be more than enough. However even for
+/// larger buffers this has 65536 entries.. This is also just a strategy, any custom queue may use
+/// a different request structure or even dynamically change it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tag(pub u16);
 
+/// The command to invoke, respectively its response if multiple are possible.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cmd(pub u16);
+
+/// A message descriptor on the control queue.
+///
+/// These must always be passed 8-byte aligned but since there are no other messages this should
+/// not present a problem.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ControlMessage {
+    /// The operand of the message. For requests the bit use is as follows (high-to-low)
+    ///
+    /// ```
+    /// |   3    |   2    |   1    |   0    |
+    /// | First Argument  |        |
+    /// |        |        |Command |
+    /// |        |        |        |  Tag 
+    /// ```
+    ///
+    /// For responses on the other hand:
+    ///
+    /// ```
+    /// |   3    |   2    |   1    |   0    |
+    /// | First Result    |        |
+    /// |        |        |Response|
+    /// |        |        |        |  Tag 
+    /// ```
+    ///
+    /// However there is no request with more than one argument currently defined. In any case, the
+    /// plan is to use the first argument as an offset into the queue memory if that ever becomes
+    /// necessary.
     pub op: u64,
 }
 
@@ -33,11 +66,14 @@ pub struct Ping {
     pub payload: Tag,
 }
 
+impl Cmd {
+    pub const BAD: Self = Cmd(!0);
+    pub const UNIMPLEMENTED: Self = Cmd(!0 - 1);
+    pub const REQUEST_NEW_RING: Self = Cmd(1);
+    pub const REQUEST_PING: Self = Cmd(2);
+}
+
 impl ControlMessage {
-    pub const BAD: u32 = !0;
-    pub const UNIMPLEMENTED: u32 = !0 - 1;
-    pub const REQUEST_NEW_RING: u32 = 1;
-    pub const REQUEST_PING: u32 = 2;
 
     /// Create a new message.
     ///
@@ -46,30 +82,30 @@ impl ControlMessage {
         msg.into()
     }
 
-    fn with_raw(op: u32, Tag(payload): Tag) -> Self {
+    fn with_raw(Cmd(op): Cmd, Tag(tag): Tag) -> Self {
         ControlMessage {
-            op: u64::from(op) << 32 | u64::from(payload)
+            op: u64::from(op) << 16 | u64::from(tag)
         }
     }
 
-    fn payload(self) -> Tag {
-        Tag(self.op as u32)
+    fn tag(self) -> Tag {
+        Tag(self.op as u16)
     }
 
-    fn operation(self) -> u32 {
-        (self.op >> 32) as u32
+    fn cmd(self) -> Cmd {
+        Cmd((self.op >> 16) as u16)
     }
 }
 
 impl From<RequestNewRing> for ControlMessage {
     fn from(RequestNewRing { payload }: RequestNewRing) -> Self {
-        ControlMessage::with_raw(ControlMessage::REQUEST_NEW_RING, payload)
+        ControlMessage::with_raw(Cmd::REQUEST_NEW_RING, payload)
     }
 }
 
 impl From<Ping> for ControlMessage {
     fn from(Ping { payload }: Ping) -> Self {
-        ControlMessage::with_raw(ControlMessage::REQUEST_PING, payload)
+        ControlMessage::with_raw(Cmd::REQUEST_PING, payload)
     }
 }
 
@@ -85,21 +121,21 @@ impl ControlMessage {
         if let Some(available) = reader.available(8) {
             let op = available.controller_u64();
             let msg = ControlMessage { op };
-            let tag = msg.payload();
-            let cmd = msg.operation();
+            let tag = msg.tag();
+            let cmd = msg.cmd();
             let (mut op, extra_space);
             match cmd {
-                ControlMessage::REQUEST_PING => {
-                    op = ControlMessage::REQUEST_PING;
+                Cmd::REQUEST_PING => {
+                    op = Cmd::REQUEST_PING;
                     extra_space = 0;
                 }
                 _ => {
-                    op = ControlMessage::UNIMPLEMENTED;
+                    op = Cmd::UNIMPLEMENTED;
                     extra_space = 0;
                 }
             };
             if extra_space > 0 {
-                op = ControlMessage::UNIMPLEMENTED;
+                op = Cmd::UNIMPLEMENTED;
             }
             // At this point, commit to writing a result.
             available.commit();
@@ -123,11 +159,15 @@ impl<'ring> ControlResponse<'ring> {
         }
     }
 
-    pub fn payload(&self) -> Tag {
-        self.msg.payload()
+    pub fn tag(&self) -> Tag {
+        self.msg.tag()
     }
 
-    pub fn operation(&self) -> u32 {
-        self.msg.operation()
+    pub fn response(&self) -> Cmd {
+        self.msg.cmd()
+    }
+
+    pub fn value0(&self) -> u32 {
+        (self.msg.op >> 32) as u32
     }
 }
