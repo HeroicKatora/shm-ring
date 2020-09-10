@@ -155,6 +155,11 @@ struct ShmHeads {
 pub struct ShmController {
     shared: Shmem,
     heads: ShmHeads,
+    state: Box<ControllerState>,
+}
+
+struct ControllerState {
+    free_queues: Vec<u32>,
 }
 
 /// A client looking to join the ring.
@@ -261,12 +266,17 @@ impl OpenOptions {
             open = ptr::NonNull::new(monitor.as_ptr().add(Self::PAGE_SIZE)).unwrap();
         }
 
+        let heads = ShmHeads {
+            monitor: monitor.cast(),
+            open: open.cast(),
+        };
+
+        let state = ControllerState::new(&self, &heads);
+
         let controller = ShmController {
             shared,
-            heads: ShmHeads {
-                monitor: monitor.cast(),
-                open: open.cast(),
-            }
+            heads,
+            state,
         };
 
         // Init sequence: write static information and lastly write the open_with information
@@ -349,6 +359,14 @@ impl ShmController {
     }
 }
 
+impl ControllerState {
+    fn new(config: &OpenOptions, heads: &ShmHeads) -> Box<Self> {
+        Box::new(ControllerState {
+            free_queues: (config.max_members..config.num_rings).collect(),
+        })
+    }
+}
+
 impl ShmClient {
     pub fn raw_join_methods(&self) -> u32 {
         self.monitor().open_with.load(Ordering::Relaxed)
@@ -372,7 +390,6 @@ impl ShmClient {
 
         let pid = os_impl::own_pid();
         let want = self.find_open_client(pid)?;
-        println!("{}@{}", pid, want);
 
         let queue = match self.join_with {
             JoinMethod::Pipe | JoinMethod::Semaphore => {
@@ -486,6 +503,10 @@ impl ShmRing {
 }
 
 impl ShmControllerRing {
+    pub fn client_id(&self) -> u32 {
+        self.this
+    }
+
     pub fn request(&mut self, msg: impl Into<control::ControlMessage>) -> Result<(), SendError> {
         let msg = msg.into().op.to_be_bytes();
         self.ring.send(&msg)

@@ -1,7 +1,7 @@
 use super::{ReadHalf, ShmController, ShmQueues};
 
 /// A tag is a payload that will be returned as part of the response.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tag(pub u32);
 
 #[repr(C)]
