@@ -199,9 +199,16 @@ pub struct ShmClientRing {
     _private: (),
 }
 
+#[derive(Debug)]
 pub struct ConnectError;
+#[derive(Debug)]
 pub struct JoinError;
+#[derive(Debug)]
 pub struct OpenError;
+#[derive(Debug)]
+pub struct SendError;
+#[derive(Debug)]
+pub struct RecvError;
 
 impl OpenOptions {
     const PAGE_SIZE: usize = 4096;
@@ -290,12 +297,25 @@ impl ShmController {
 
     /// Handle a round of messages.
     /// Will never block but might take a while?
-    pub fn enter(&self) {
+    pub fn enter(&mut self) {
         self.handle_new_client();
         self.handle_client_queues();
     }
 
     fn handle_new_client(&self) {
+        let join_futex = &self.open().futex;
+        let request = join_futex.load(Ordering::Acquire) as u32;
+        if request < self.monitor().max_members.load(Ordering::Relaxed) {
+            // We must reset the queue. Assumes there is no current user here. The old secondary
+            // was apparently gone and we would be the primary.
+            self.heads.queues_controller(request).reset();
+
+            // Now release that state, queue is ready.
+            join_futex.store(0, Ordering::Release);
+        } else if request != 0 {
+            // No idea what that was but reset so that other clients can signal.
+            join_futex.store(0, Ordering::Release);
+        }
     }
 
     fn handle_client_queues(&self) {
@@ -408,6 +428,52 @@ impl JoinMethod {
 }
 
 impl ShmRing {
+    pub fn send(&mut self, data: &[u8]) -> Result<(), SendError> {
+        let len = u32::try_from(data.len()).map_err(|_| SendError)?;
+        let mut writer = self.queues.half_to_write_to();
+
+        let write = writer.prepare_write(len).ok_or(SendError)?;
+        let (lhs, rhs) = data.split_at(write.unwrapped.len());
+        write.unwrapped.copy_from_slice(lhs);
+        write.wrapped.copy_from_slice(rhs);
+        write.commit();
+
+        Ok(())
+    }
+
+    pub fn recv<T>(
+        &mut self,
+        data: &mut [u8],
+        pre_commit: impl FnOnce(&mut [u8], &ReadHalf) -> T
+    ) -> Result<T, RecvError> {
+        let len = u32::try_from(data.len()).map_err(|_| RecvError)?;
+        let mut reader = self.queues.half_to_read_from();
+
+        let read = reader.available(len).ok_or(RecvError)?;
+        let (lhs, rhs) = data.split_at_mut(read.unwrapped.len());
+        lhs.copy_from_slice(read.unwrapped);
+        rhs.copy_from_slice(read.wrapped);
+        let result = pre_commit(data, read.commit);
+        read.commit();
+
+        Ok(result)
+    }
+}
+
+impl ShmControllerRing {
+    pub fn request(&mut self, msg: impl Into<control::ControlMessage>) -> Result<(), SendError> {
+        let msg = msg.into().op.to_be_bytes();
+        self.ring.send(&msg)
+    }
+
+    pub fn response<T>(&mut self, handler: impl FnOnce(control::ControlResponse) -> T) -> Result<T, RecvError> {
+        let mut op = [0; 8];
+        self.ring.recv(&mut op, |filled, ring| {
+            let op = <&mut [u8; 8]>::try_from(filled).unwrap();
+            let resp = control::ControlResponse::new(ring, *op);
+            handler(resp)
+        })
+    }
 }
 
 impl ShmHeads {
@@ -481,7 +547,7 @@ impl ShmHeads {
         }
     }
 
-    /// FIXME: should we make this unsafe just because?
+    /// FIXME: should we make this unsafe? Returned value assumes to own that side of the queue.
     fn queues_controller(&self, this: u32) -> ShmQueues {
         let (private_head, private_queues, private_mem);
         // FIXME: validated pointers? We trust the server but it's a precaution against
@@ -507,8 +573,19 @@ impl ShmQueues {
         }
     }
 
+    fn head(&self) -> &QueueHead {
+        unsafe { &*self.private_head.as_ptr() }
+    }
+
+    /// Reset the queue. Must guarantee that we have a unique reference to it!
+    fn reset(&self) {
+        let queue = self.head();
+        queue.half_a.reset();
+        queue.half_b.reset();
+    }
+
     fn half_to_read_from(&mut self) -> ReadHalf<'_> {
-        let queue = unsafe { &*self.private_head.as_ptr() };
+        let queue = self.head();
         let (inner, offset) = if self.is_a_side {
             (&queue.half_b, OpenOptions::PAGE_SIZE)
         } else {
@@ -544,8 +621,21 @@ impl ShmQueues {
     }
 }
 
+impl QueueHalf {
+    fn reset(&self) {
+        self.futex_a.store(0, Ordering::Relaxed);
+        self.read_head.store(0, Ordering::Relaxed);
+        self.write_head.store(0, Ordering::Relaxed);
+        let atomic_user = unsafe { &*(self.user_data.get() as *const AtomicU64) };
+        atomic_user.store(0, Ordering::Relaxed);
+    }
+}
+
+// FIXME: perfectly honest, those references to the buffer aren't right. The contents may change
+// and we would need freeze to avoid it.
 struct PreparedRead<'buffer> {
-    commit: &'buffer AtomicU32,
+    /// Access to the underlying reader.
+    commit: &'buffer ReadHalf<'buffer>,
     unwrapped: &'buffer [u8],
     wrapped: &'buffer [u8],
     read_base: u32,
@@ -553,7 +643,8 @@ struct PreparedRead<'buffer> {
 }
 
 struct PreparedWrite<'buffer> {
-    commit: &'buffer AtomicU32,
+    /// Access to the underlying writer.
+    commit: &'buffer WriteHalf<'buffer>,
     unwrapped: &'buffer mut [u8],
     wrapped: &'buffer mut [u8],
     write_base: u32,
@@ -588,12 +679,17 @@ impl ReadHalf<'_> {
 
         // SAFETY: synchronized as required. The other thread has release this.
         let (first, wrapped) = unsafe {
+            // By taking `&mut self` we are indeed the only referent. In particular, the other side
+            // should only write again after we have ACKed this part but we do not allow committing
+            // that while the return value lives.
+            // FIXME: taking borrow on bytes, should probably only take a borrow on the atomic slice.
+            // Do we trust the other side unsafely?
             let norm = &*slice::from_raw_parts(buffer.add(reader as usize), norm_half as usize);
             let wrapping = &*slice::from_raw_parts(buffer, wrap_half as usize);
             (norm, wrapping)
         };
         Some(PreparedRead {
-            commit: &self.inner.read_head,
+            commit: &*self,
             read_base: reader,
             read_end: (reader + ready) % modulo,
             unwrapped: first,
@@ -619,11 +715,11 @@ impl PreparedRead<'_> {
 
     fn commit(self) {
         if cfg!(debug_assertions) {
-            let must_succeed = self.commit.compare_exchange(
+            let must_succeed = self.commit.inner.read_head.compare_exchange(
                 self.read_base, self.read_end, Ordering::Release, Ordering::Relaxed);
             must_succeed.expect("Another thread accessed supposedly owned read head");
         } else {
-            self.commit.store(self.read_end, Ordering::Release);
+            self.commit.inner.read_head.store(self.read_end, Ordering::Release);
         }
     }
 }
@@ -656,12 +752,17 @@ impl WriteHalf<'_> {
 
         // SAFETY: synchronized as required. The other thread has release this.
         let (first, wrapped) = unsafe {
+            // By taking `&mut self` we are indeed the only referent. In particular, the other side
+            // should only read the data after we have ACKed this part but we do not allow committing
+            // that while the return value lives.
+            // FIXME: taking mutable borrow, should probably only take a borrow on the atomic slice.
+            // Do we trust the other side unsafely?
             let norm = &mut *slice::from_raw_parts_mut(buffer.add(writer as usize), norm_half as usize);
             let wrapping = &mut *slice::from_raw_parts_mut(buffer, wrap_half as usize);
             (norm, wrapping)
         };
         Some(PreparedWrite {
-            commit: &self.inner.read_head,
+            commit: &*self,
             write_base: writer,
             write_end: (writer + empty) % modulo,
             unwrapped: first,
@@ -685,13 +786,14 @@ impl PreparedWrite<'_> {
         let buf = bh.or(lh).expect("logic bug");
         *buf = val;
     }
+
     fn commit(self) {
         if cfg!(debug_assertions) {
-            let must_succeed = self.commit.compare_exchange(
+            let must_succeed = self.commit.inner.write_head.compare_exchange(
                 self.write_base, self.write_end, Ordering::Release, Ordering::Relaxed);
             must_succeed.expect("Another thread accessed supposedly owned write head");
         } else {
-            self.commit.store(self.write_end, Ordering::Release);
+            self.commit.inner.write_head.store(self.write_end, Ordering::Release);
         }
     }
 }

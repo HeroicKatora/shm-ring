@@ -1,13 +1,18 @@
-use super::{ShmController, ShmQueues};
+use super::{ReadHalf, ShmController, ShmQueues};
 
 /// A tag is a payload that will be returned as part of the response.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Tag(pub u32);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ControlMessage {
     pub op: u64,
+}
+
+pub struct ControlResponse<'ring> {
+    pub msg: ControlMessage,
+    ring: &'ring ReadHalf<'ring>,
 }
 
 /// Request a new ring.
@@ -105,5 +110,24 @@ impl ControlMessage {
             write.controller_u64(answer.op);
             write.commit();
         }
+    }
+}
+
+impl<'ring> ControlResponse<'ring> {
+    pub fn new(ring: &'ring ReadHalf, op: [u8; 8]) -> Self {
+        ControlResponse {
+            ring: ring,
+            msg: ControlMessage {
+                op: u64::from_be_bytes(op),
+            },
+        }
+    }
+
+    pub fn payload(&self) -> Tag {
+        self.msg.payload()
+    }
+
+    pub fn operation(&self) -> u32 {
+        self.msg.operation()
     }
 }
