@@ -38,6 +38,16 @@ fn main() {
         }
     };
 
+    if listen == u32::MAX {
+        println!("[-] Bad request?");
+        std::process::exit(1);
+    }
+
+    if listen == u32::MAX - 1 {
+        println!("[-] Unimplemented?");
+        std::process::exit(1);
+    }
+
     println!("[+] Granted {}", listen);
 
     loop {

@@ -324,11 +324,12 @@ impl ShmController {
     fn handle_new_client(&self) {
         os_impl::join_futex(self, |request| {
             self.heads.queues_controller(request).reset();
+            self.monitor().members.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     fn handle_client_queues(&self) {
-        let clients = self.monitor().members.load(Ordering::Relaxed);
+        let clients = self.monitor().max_members.load(Ordering::Relaxed);
         for i in 0..clients {
             let queue = self.heads.queues_controller(i);
             control::ControlMessage::execute(self, queue);
@@ -701,11 +702,11 @@ impl ReadHalf<'_> {
     }
 
     fn available(&mut self, count: u32) -> Option<PreparedRead<'_>> {
-        let (reader, ready) = self.acquire_ready(count)?;
+        let (reader, _) = self.acquire_ready(count)?;
         let modulo = OpenOptions::PAGE_SIZE as u32;
 
-        let norm_half = (reader + ready).min(modulo);
-        let wrap_half = (reader + ready).max(modulo) - modulo;
+        let norm_half = (reader + count).min(modulo);
+        let wrap_half = (reader + count).max(modulo) - modulo;
 
         let buffer = self.buffer.get() as *const u8;
 
@@ -723,7 +724,7 @@ impl ReadHalf<'_> {
         Some(PreparedRead {
             commit: &*self,
             read_base: reader,
-            read_end: (reader + ready) % modulo,
+            read_end: (reader + count) % modulo,
             unwrapped: first,
             wrapped,
         })
@@ -765,20 +766,24 @@ impl WriteHalf<'_> {
         let reader = self.inner.read_head.load(Ordering::Acquire);
         let modulo = OpenOptions::PAGE_SIZE as u32;
 
-        let empty = ((reader + modulo) - writer) % modulo;
-        if empty <= count { // Strict, new end must be smaller than reader.
+        // Why -1? Two reasons: Firstly we must never bump the write pointer into the read pointer.
+        // That is an empty buffer. So conveniently we calculate the last allowed address instead
+        // by subtracting one (note after adding page size so no overflows) and then do a
+        // comparison against that.
+        let empty = ((reader + modulo - 1) - writer) % modulo;
+        if empty < count { // Strict, new end must be smaller than reader.
             None
         } else {
-            Some((writer, empty))
+            Some((writer, empty + 1))
         }
     }
 
     fn prepare_write(&mut self, count: u32) -> Option<PreparedWrite<'_>> {
-        let (writer, empty) = self.acquire_ready(count)?;
+        let (writer, _) = self.acquire_ready(count)?;
         let modulo = OpenOptions::PAGE_SIZE as u32;
 
-        let norm_half = (writer + empty).min(modulo);
-        let wrap_half = (writer + empty).max(modulo) - modulo;
+        let norm_half = (writer + count).min(modulo);
+        let wrap_half = (writer + count).max(modulo) - modulo;
 
         let buffer = self.buffer.get() as *mut u8;
 
@@ -796,7 +801,7 @@ impl WriteHalf<'_> {
         Some(PreparedWrite {
             commit: &*self,
             write_base: writer,
-            write_end: (writer + empty) % modulo,
+            write_end: (writer + count) % modulo,
             unwrapped: first,
             wrapped,
         })
