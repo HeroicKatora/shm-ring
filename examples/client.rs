@@ -77,9 +77,19 @@ fn main() {
     }
 
     println!("[+] Server found {}", queue);
+    let msg: [u8; 1] = [queue as u8; 1];
+    let mut queue = client.trust_me_with_all_queues().as_client(queue);
 
+    queue.send(&msg).expect("No more space?");
+    println!("[+] Message sent");
+
+    let ref mut buffer = [0u8; 1];
     loop {
-        // TODO: echo back all bytes received on the control ring
+        if let Ok(_) = queue.recv(buffer) {
+            println!("[+] Answer received");
+            assert_eq!(*buffer, msg);
+            break;
+        }
     }
 }
 

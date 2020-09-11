@@ -54,8 +54,15 @@ fn main() {
     
     assert_eq!(kind, Cmd::REQUEST_NEW_RING);
     println!("[+] Granted {}", listen);
+    let mut queue = server.trust_me_with_all_queues().as_server(listen);
 
+    let ref mut buffer = [0u8; 1];
     loop {
         // TODO: echo back all bytes received on the control ring
+        if let Ok(_) = queue.recv(buffer) {
+            println!("[+] Message received {:?}", buffer);
+            while let Err(_) = queue.send(buffer) {}
+            println!("[+] Answer sent");
+        }
     }
 }

@@ -1028,7 +1028,7 @@ impl ReadHalf<'_> {
         let wrap_half = (reader + count).max(modulo) - modulo;
 
         let buffer = &self.buffer[..OpenOptions::PAGE_SIZE];
-        let first = &buffer[reader as usize..][..norm_half as usize];
+        let first = &buffer[reader as usize..norm_half as usize];
         let wrapped = &buffer[..wrap_half as usize];
 
         Some(PreparedRead {
@@ -1100,7 +1100,7 @@ impl WriteHalf<'_> {
         // SAFETY: synchronized as relaxed so we don't need synchronization to avoid UB. However,
         // the information is only coherent if the other thread has released this.
         let buffer = &self.buffer[..OpenOptions::PAGE_SIZE];
-        let first = &buffer[writer as usize..][..norm_half as usize];
+        let first = &buffer[writer as usize..norm_half as usize];
         let wrapped = &buffer[..wrap_half as usize];
 
         Some(PreparedWrite {
