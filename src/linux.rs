@@ -3,6 +3,11 @@ use super::{ConnectError, ShmClient, ShmController};
 use core::sync::atomic::Ordering;
 use linux_futex::{AsFutex, Futex, Shared, WaitError};
 
+// Enable futex based join.
+pub fn join_methods() -> u32 {
+    0x2
+}
+
 pub fn own_pid() -> u64 {
     unsafe { libc::getpid() as u64 }
 }

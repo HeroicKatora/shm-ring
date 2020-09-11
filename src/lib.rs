@@ -2,29 +2,60 @@
 //!
 //! Use with any language capable of mapping anonymous files and accessing them as bytes.
 //!
+//! ## Layout
+//!
+//! The layout is defined via basic C-structures, assuming the simplest compliant layout. That is,
+//! all types and fields are aligned, and fields are placed one after noahter with smallest offset.
+//! Further, n-byte integers and atomics have exactly size of `n`. Alignments are never larger than
+//! the size. All relevant structs are defined without interior padding (otherwise report a bug).
+//!
+//! At times we use the term vaddress.  This always means an address within the shared memory file,
+//! i.e. an offset to the start of the memory mapped file if you use that mechanism.
+//!
+//! Currently Page always means `4096` bytes.
+//!
+//! - @0, one Page: A [`MonitorHead`], called `head`.
+//! - @`head.open`, one Page: A [`MonitorOpen`], called `open`.
+//! - @`head.head_start`, N Pages: Each page is a [`QueueHead`], starting with the pages for the
+//!   `head.max_members` member slots. There is exactly one page per Queue. Queues are identified
+//!   by their page offset, i.e. the queue at `head.head_start` is queue 0 and the one at 
+//!   `head.head_start + PAGE_SIZE` is queue 1.
+//! - @`head.queue_start`, 2*N Pages: Each two pages are one queue with space for the A and B side.
+//! - @`head.scratch_start`, 2*N Pages: Each two pages are one scratch space for the A and B side.
+//! - @`head.member_list`: A vaddress pointing to a list of `AtomicU64` with `head.max_members`
+//!   entries. Each entry can hold the PID of a client occupying that slot. See below.
+//! - @`open.pipe_name`: If non-zero then a vaddress pointing to the name of the pipe for joining by
+//!   pipe.
+//!
+//! [`MonitorHead`]: struct.MonitorHead.html
+//! [`MonitorOpen`]: struct.MonitorOpen.html
+//! [`QueueHead`]: struct.QueueHead.html
+//!
 //! ## Joining
 //!
 //! 1. Inspect the monitor head to determine a join method that is implemented.
-//! 1.1. Might inspect the member count to see if joining is probable at all.
-//!
+//!    1. Might inspect the member count to see if joining is probable at all.
 //! 2. Joining.
 //!    The problem here is to distribute client identities. This process must not race between
 //!    different clients (potential members). We may want some mediation as well. At the same time
 //!    we need to notify the controller of our initial presence (which must setup any watch dog if
 //!    we consider sudden exits). All of this must happen efficiently such that no spin lock is
 //!    necessary. Basically we need an alternative to interrupts/syscalls here.
-//! 2.1 The first step is to grab one client spot. This is done by atomically exchanging a client
-//!   entry for your own process ID. This allows the server to detect if the process is gone. This
-//!   has false positives if PIDs are reused but no false negatives so that no active state is
-//!   destroyed. The next step depends on the synchronization method.
-//!
-//! 2.2. Joining via a pipe.
-//! 2.2.1. Write the member ID as a Network Endian integer into the indicated pipe.
-//!
-//! 2.2. Joining via a futex.
-//! 2.2.2. Try to update the `futex` of the open page from `0` to your member ID.
-//! 2.2.3. Wait for the controller to notice. It will unlock the futex to `0` when it does. On
-//!   failure, another process interfered, retry.
+//!    1. The first step is to grab one client spot. This is done by atomically exchanging a client
+//!       entry for your own process ID. This allows the server to detect if the process is gone. This
+//!       has false positives if PIDs are reused but no false negatives so that no active state is
+//!       destroyed. The next step depends on the synchronization method.
+//!    2. Joining via a futex.
+//!       1. Try to update the `futex` of the open page from `0` to your member ID.
+//!       2. Wait for the controller to notice. It will unlock the futex to `0` when it does. On
+//!          failure, another process interfered, retry.
+//!    3. Joining via a pipe.
+//!       1. Write the member ID as a Network Endian integer into the indicated pipe. Attach a
+//!          process file desciptor of your own PID as out-of-band data if you want.
+//!       2. I'm not sure how to ensure the server has read it. The server replying with that same
+//!          int feels kind of racey if it gets buffered?
+//!    4. Joining via a semaphore.
+//!       1. Not yet specified.
 //!
 //! ## Thread (/threat) model
 //!
@@ -55,35 +86,38 @@ use core::sync::atomic::{AtomicU8, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use shared_memory::Shmem;
 use atomic::{AtomicMem, Slice};
 
-pub const MEMBER_LIMIT: usize = 256;
+/// The magic number identifying an shm-ring shared memory file.
+pub const SHM_MAGIC: u32 = 0x9d14_c252;
+/// The maximum supported number of controlled members.
+pub const MEMBER_LIMIT: u32 = OpenOptions::MEMBERS_MAX;
+/// The maximum support number of controlled rings.
+pub const RING_LIMIT: u32 = OpenOptions::RINGS_MAX;
 
 /// The monitor head is _only_ written by the controller.
 #[repr(C)]
 pub struct MonitorHead {
-    magic: AtomicU32,
+    pub magic: AtomicU32,
     /// Static version of this header structure.
-    version: AtomicU32,
+    pub version: AtomicU32,
     /// A bit-mask of available methods for opening a new handle.
     /// `0x00000001`: wait by reading from a named pipe
     /// `0x00000002`: futex based waiting using the futex in the head (?? WIP details)
     /// `0x00000004`: wait using an semaphore (?? WIP details)
-    open_with: AtomicU32,
+    pub open_with: AtomicU32,
     /// File-relative address of the page for new process to join.
-    open_page: AtomicU64,
+    pub open_page: AtomicU64,
     /// File-relative address of the first page used by queue heads.
-    head_start: AtomicU64,
+    pub head_start: AtomicU64,
     /// File-relative address of the first page used by queues.
-    queue_start: AtomicU64,
+    pub queue_start: AtomicU64,
     /// File-relative address of the first page used for shared memory of queues.
-    heap_start: AtomicU64,
+    pub scratch_start: AtomicU64,
     /// The number of current members.
-    members: AtomicU32,
+    pub members: AtomicU32,
     /// The maximal number of members.
-    max_members: AtomicU32,
-    /// The start address of the pipe's name if any.
-    pipe_name: AtomicU64,
+    pub max_members: AtomicU32,
     /// The start address of the member list. It has `max_members` entries.
-    member_list: AtomicU64,
+    pub member_list: AtomicU64,
 }
 
 /// The page with which new clients communicate with the controller.
@@ -91,22 +125,27 @@ pub struct MonitorHead {
 pub struct MonitorOpen {
     /// A shared register where a process can write its address.
     /// Must first hold the futex.
-    tid_futex: u64,
+    pub tid_futex: u64,
     /// A shared register where a process can write its address.
     /// Must first hold the semaphore.
-    tid_semaphore: u64,
+    pub tid_semaphore: u64,
     /// Futex to wait on for global control operations such as join.
-    futex: AtomicI32,
-    _align_futex: u32, // Filler. Unused.
+    pub futex: AtomicI32,
+    /// Filler. Unused. Don't use. Might get used.
+    /// NOTE: This field is only pub for rustdoc.
+    #[cfg(not(rustdoc))] pub _reserved: u32,
+    #[cfg(rustdoc)] _reserved: u32,
+    /// The start address of the pipe's name if any.
+    pub pipe_name: AtomicU64,
 }
 
 /// A queue between two threads.
 #[repr(C)]
 pub struct QueueHead {
     /// The struct controlled by side A.
-    half_a: QueueHalf,
+    pub half_a: QueueHalf,
     /// The struct controlled by side B.
-    half_b: QueueHalf,
+    pub half_b: QueueHalf,
 }
 
 /// A reader from a queue.
@@ -124,24 +163,35 @@ pub struct WriteHalf<'queue> {
 #[repr(C)]
 pub struct QueueHalf {
     /// First futex that the threads may use.
-    futex_a: AtomicI32,
-    _reserved: u32,
+    pub futex_a: AtomicI32,
+    /// Filler. Unused. Don't use. Might get used.
+    /// NOTE: This field is only pub for rustdoc.
+    #[cfg(not(rustdoc))] pub _reserved: u32,
+    #[cfg(rustdoc)] _reserved: u32,
     /// The write head.
-    write_head: AtomicU32,
+    pub write_head: AtomicU32,
     /// The read head.
-    read_head: AtomicU32,
+    pub read_head: AtomicU32,
     /// Private use data for this side.
-    user_data: cell::UnsafeCell<u64>,
+    pub user_data: cell::UnsafeCell<u64>,
 }
 
+/// An enumeration (as mask bits) of available join methods.
+///
+/// See the crate level documentation for a description of each method and the motivation behind
+/// doing one through the controller at all.
 #[derive(Clone, Copy)]
 #[repr(u32)]
 pub enum JoinMethod {
+    /// If the bit is set then the controller allows joining by pipe.
     Pipe = 0x00000001,
+    /// If the bit is set then the controller allows joining by futex.
     Futex = 0x00000002,
+    /// If the bit is set then the controller allows joining by semaphore.
     Semaphore = 0x00000004,
 }
 
+/// A builder for a new shared memory controller or joining an existing one.
 pub struct OpenOptions {
     num_rings: u32,
     max_members: u32,
@@ -162,6 +212,24 @@ pub struct ShmController {
 
 struct ControllerState {
     free_queues: Vec<u32>,
+}
+
+pub struct Events {
+    joined: Vec<(u64, u32)>,
+    messages: Vec<(control::ControlMessage, control::ControlMessage)>,
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum Event {
+    Joined {
+        who: u64,
+        on: u32,
+    },
+    Message {
+        message: control::ControlMessage,
+        answer: control::ControlMessage,
+    },
 }
 
 /// A client looking to join the ring.
@@ -223,9 +291,9 @@ pub struct OptionsError;
 impl OpenOptions {
     const PAGE_SIZE: usize = 4096;
     // TODO: do we want a useful magic before release?
-    const MAGIC: u32 = 0x9d14_c252;
+    const MAGIC: u32 = SHM_MAGIC;
     const RINGS_MAX: u32 = 4096;
-    const MEMBERS_MAX: u32 = 4096;
+    const MEMBERS_MAX: u32 = 256;
 
     pub fn new() -> Self {
         OpenOptions {
@@ -330,10 +398,9 @@ impl OpenOptions {
         let first_queue = first_head + u64::from(self.num_rings);
         monitor.queue_start.store(first_queue * Self::PAGE_SIZE as u64, Ordering::Release);
         let first_heap = first_queue + 2 * u64::from(self.num_rings);
-        monitor.heap_start.store(first_heap * Self::PAGE_SIZE as u64, Ordering::Release);
+        monitor.scratch_start.store(first_heap * Self::PAGE_SIZE as u64, Ordering::Release);
         monitor.members.store(0, Ordering::Release);
         monitor.max_members.store(self.max_members, Ordering::Release);
-        monitor.pipe_name.store(0, Ordering::Release);
         // For now, starts directly behind head.
         let member_list_start = u64::try_from(mem::size_of::<MonitorHead>()).unwrap();
         monitor.member_list.store(member_list_start, Ordering::Release);
@@ -342,11 +409,12 @@ impl OpenOptions {
             member.store(0, Ordering::Release);
         }
 
-        controller.open().futex.store(-1, Ordering::Release);
+        let open = controller.open();
+        open.futex.store(-1, Ordering::Release);
+        open.pipe_name.store(0, Ordering::Release);
 
-        // Enable futex based join.
-        // TODO: can't do that on all systems.
-        monitor.open_with.store(0x2, Ordering::Release);
+        // Finally, store the join methods.
+        monitor.open_with.store(os_impl::join_methods(), Ordering::Release);
 
         Ok(controller)
     }
@@ -368,22 +436,35 @@ impl ShmController {
     /// Handle a round of messages.
     /// Will never block but might take a while?
     pub fn enter(&mut self) {
-        self.handle_new_client();
-        self.handle_client_queues();
+        self.handle_new_client(None);
+        self.handle_client_queues(None);
     }
 
-    fn handle_new_client(&self) {
+    /// Enter and collect/trace events that happened.
+    pub fn enter_with_events(&mut self, events: &mut Events) {
+        self.handle_new_client(Some(events));
+        self.handle_client_queues(Some(events));
+    }
+
+    fn handle_new_client(&self, mut events: Option<&mut Events>) {
         os_impl::join_futex(self, |request| {
+            let who = self.member_list()[request as usize].load(Ordering::Relaxed);
+
+            if let Some(ref mut events) = events {
+                events.who_joined_on(who, request);
+            }
+
             self.heads.queues_controller(request).reset();
             self.monitor().members.fetch_add(1, Ordering::Relaxed);
         });
     }
 
-    fn handle_client_queues(&mut self) {
+    fn handle_client_queues(&mut self, mut events: Option<&mut Events>) {
         let clients = self.monitor().max_members.load(Ordering::Relaxed);
         for i in 0..clients {
             let queue = self.heads.queues_controller(i);
-            control::ControlMessage::execute(self, queue);
+            let events = events.as_mut().map(|e| &mut **e);
+            control::ControlMessage::execute(self, queue, events);
         }
     }
 
@@ -405,6 +486,36 @@ impl ControllerState {
         Box::new(ControllerState {
             free_queues: (config.max_members..config.num_rings).collect(),
         })
+    }
+}
+
+impl Events {
+    /// Clear events, return how many were ignored.
+    pub fn clear(&mut self) -> usize {
+        let ignored = self.joined.len() + self.messages.len();
+        self.joined.clear();
+        self.messages.clear();
+        ignored
+    }
+
+    pub fn pop(&mut self) -> Option<Event> {
+        if let Some((who, on)) = self.joined.pop() {
+            return Some(Event::Joined { who, on });
+        }
+
+        if let Some((message, answer)) = self.messages.pop() {
+            return Some(Event::Message { message, answer })
+        }
+
+        None
+    }
+
+    fn who_joined_on(&mut self, who: u64, on: u32) {
+        self.joined.push((who, on))
+    }
+
+    fn request(&mut self, what: control::ControlMessage, answer: control::ControlMessage) {
+        self.messages.push((what, answer))
     }
 }
 
@@ -585,7 +696,7 @@ impl ShmHeads {
 
     pub(crate) fn open(&self) -> &MonitorOpen {
         assert!(mem::size_of::<MonitorOpen>() <= OpenOptions::PAGE_SIZE);
-        unsafe { &*(self.monitor.as_ptr() as *const MonitorOpen) }
+        unsafe { &*(self.open.as_ptr() as *const MonitorOpen) }
     }
 
     pub(crate) fn member_list(&self) -> &[AtomicU64] {
@@ -623,7 +734,7 @@ impl ShmHeads {
         }
     }
 
-    fn heap_start(&self, this: u32) -> ptr::NonNull<u8> {
+    fn scratch_start(&self, this: u32) -> ptr::NonNull<u8> {
         let base = self.monitor.as_ptr() as *mut u8;
 
         let start = self.monitor().head_start.load(Ordering::Relaxed) as usize;
@@ -641,7 +752,7 @@ impl ShmHeads {
         // alternative implementations that are wrong..
         private_head = self.head_start(this);
         private_queues = self.queue_start(this);
-        private_mem = self.heap_start(this);
+        private_mem = self.scratch_start(this);
 
         ShmQueues {
             private_head,

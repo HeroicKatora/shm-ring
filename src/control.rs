@@ -1,4 +1,4 @@
-use super::{ReadHalf, ShmController, ShmQueues};
+use super::{Events, ReadHalf, ShmController, ShmQueues};
 
 /// A tag is an identifier for a pending request.
 ///
@@ -17,7 +17,8 @@ pub struct Cmd(pub u16);
 /// These must always be passed 8-byte aligned but since there are no other messages this should
 /// not present a problem.
 #[repr(C)]
-#[derive(Clone, Copy)]
+// TODO: may want to change Debug to something struct-like.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ControlMessage {
     /// The operand of the message. For requests the bit use is as follows (high-to-low)
     ///
@@ -115,7 +116,7 @@ impl From<Ping> for ControlMessage {
 
 /// Private implementation of commands.
 impl ControlMessage {
-    pub(crate) fn execute(controller: &mut ShmController, mut queue: ShmQueues) {
+    pub(crate) fn execute(controller: &mut ShmController, mut queue: ShmQueues, mut events: Option<&mut Events>) {
         if queue.half_to_write_to().prepare_write(8).is_none() {
             // No space for response. Don't.
             return;
@@ -158,6 +159,11 @@ impl ControlMessage {
             let mut write = writer.prepare_write(8).unwrap();
             write.controller_u64(answer.op);
             write.commit();
+
+            if let Some(ref mut events) = &mut events {
+                // TODO: provide info on who or what queue?
+                events.request(msg, answer);
+            }
         }
     }
 }
