@@ -86,6 +86,20 @@ use core::sync::atomic::{AtomicU8, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use shared_memory::Shmem;
 use atomic::{AtomicMem, Slice};
 
+/// A bit mask marking unstable versions.
+pub const FORMAT_IS_UNSTABLE: u32 = 0x8000_0000;
+/// The current format version of the monitor head.
+/// An unstable version (see `FORMAT_IS_UNSTABLE`) must match exactly because we take complete
+/// freedom in the layout of the header, it's remaining bits are randomly generated once per bump.
+//TODO: figure out if we can 'automatically' test for layout stability by doing some const-eval.
+pub const FORMAT_VERSION: u32 = 1
+    // FIXME: comment this line when it's ready.
+    | FORMAT_IS_UNSTABLE | 0xffbd_833c
+    // Line exists to nicely terminate the above expression.
+    | 0;
+/// An incompatible change will change some bit within this mask.
+pub const FORMAT_COMPAT_MASK: u32 = 0x7fff_0000;
+
 /// The magic number identifying an shm-ring shared memory file.
 pub const SHM_MAGIC: u32 = 0x9d14_c252;
 /// The maximum supported number of controlled members.
@@ -363,15 +377,42 @@ impl OpenOptions {
         let shared = shared_memory::ShmemConf::new()
             .flink(path)
             .open()?;
-        assert!(shared.len() >= mem::size_of::<MonitorHead>());
-        let head = ptr::NonNull::new(shared.as_ptr()).unwrap();
-        let heads = unsafe {
-            ShmHeads::from_monitor(head.cast())
-        }.map_err(|_| shared_memory::ShmemError::MapSizeZero)?;
-
-        if heads.monitor().magic.load(Ordering::Acquire) != OpenOptions::MAGIC {
+        // Okay, can we begin inspecting the pages?
+        if shared.len() < mem::size_of::<MonitorHead>() {
             return Err(shared_memory::ShmemError::MapSizeZero);
         }
+
+        let head = ptr::NonNull::new(shared.as_ptr()).unwrap();
+        let monitor_only: &MonitorHead = unsafe { &*head.cast().as_ptr() };
+
+        // Check magic to ensure it's not a completely stupid shared memory.
+        if monitor_only.magic.load(Ordering::Acquire) != OpenOptions::MAGIC {
+            return Err(shared_memory::ShmemError::MapSizeZero);
+        }
+
+        // Now check version compatibility.
+        let aparent_version = monitor_only.version.load(Ordering::Relaxed);
+
+        if FORMAT_VERSION & FORMAT_IS_UNSTABLE != 0 {
+            if aparent_version != FORMAT_VERSION {
+                return Err(shared_memory::ShmemError::MapSizeZero);
+            }
+        } else {
+            if aparent_version & FORMAT_COMPAT_MASK != FORMAT_VERSION & FORMAT_COMPAT_MASK {
+                return Err(shared_memory::ShmemError::MapSizeZero);
+            }
+        }
+
+        // Okay, now the current format specific checks.
+        if shared.len() < 2*mem::size_of::<MonitorHead>() {
+            return Err(shared_memory::ShmemError::MapSizeZero);
+        }
+
+        let heads = unsafe {
+            // SAFETY: we've somewhat validated this is the right shared memory. At least it's
+            // large enough.
+            ShmHeads::from_monitor(head.cast(), shared.len())
+        }.map_err(|_| shared_memory::ShmemError::MapSizeZero)?;
 
         Ok(ShmClient {
             shared,
@@ -414,7 +455,7 @@ impl OpenOptions {
         // Init sequence: write static information and lastly write the open_with information
         let monitor = controller.monitor();
         monitor.magic.store(OpenOptions::MAGIC, Ordering::Release);
-        monitor.version.store(1, Ordering::Release);
+        monitor.version.store(FORMAT_VERSION, Ordering::Release);
         monitor.open_page.store(Self::PAGE_SIZE as u64, Ordering::Release);
         let first_head = 3;
         monitor.head_start.store(first_head * Self::PAGE_SIZE as u64, Ordering::Release);
@@ -792,15 +833,71 @@ impl<'shared_is_alive> TrustedQueues<'shared_is_alive> {
 }
 
 impl ShmHeads {
-    pub(crate) unsafe fn from_monitor(ptr: ptr::NonNull<MonitorHead>) -> Result<Self, OpenError> {
+    /// Open a heads page.
+    /// # Safety
+    /// Caller must guarantee that `ptr` can be dereferenced at least one page and that it points
+    /// to a shm-ring shared memory page that has been mmap'ed into contiguous memory. Then this
+    /// code will check all interior invariants to sanity check the whole thing.
+    pub(crate) unsafe fn from_monitor(ptr: ptr::NonNull<MonitorHead>, len: usize) -> Result<Self, OpenError> {
+        // Check offsets against the total length.
+        struct PageBound(u64);
+
+        impl PageBound {
+            fn from_length(len: u64) -> Self {
+                PageBound(len)
+            }
+            fn fits_pages_at(&self, at: u64, pages: u64) -> Result<(), OpenError> {
+                let page_size = u64::try_from(OpenOptions::PAGE_SIZE).unwrap();
+                if at & (page_size - 1) != 0 {
+                    return Err(OpenError);
+                }
+                let page_required = pages.checked_mul(page_size).ok_or(OpenError)?;
+                self.fits_length_at(at, page_required)
+            }
+            fn fits_length_at(&self, at: u64, required: u64) -> Result<(), OpenError> {
+                if self.0.checked_sub(required) < Some(at) {
+                    return Err(OpenError);
+                }
+                Ok(())
+            }
+        }
+
+        // SAFETY: caller guarantees at least one valid page.
         let monitor = &*ptr.as_ptr();
+        let length = match u64::try_from(len) {
+            Err(_) => return Err(OpenError),
+            Ok(length) => length,
+        };
+
+        let page_bound = PageBound::from_length(length);
+
         if monitor.open_with.load(Ordering::Acquire) == 0 {
             // Oops, not yet initialized.
             return Err(OpenError);
         }
+
         let open_offset = monitor.open_page.load(Ordering::Acquire);
-        let open_offset = usize::try_from(open_offset).map_err(|_| OpenError)?;
+        page_bound.fits_pages_at(open_offset, 1)?;
+        let nr_queues = monitor.nr_queues.load(Ordering::Acquire);
+        let heads = monitor.head_start.load(Ordering::Acquire);
+        page_bound.fits_pages_at(heads, u64::from(nr_queues))?;
+        let queues = monitor.queue_start.load(Ordering::Acquire);
+        page_bound.fits_pages_at(queues, 2 * u64::from(nr_queues))?;
+        let scratch = monitor.scratch_start.load(Ordering::Acquire);
+        page_bound.fits_pages_at(scratch, 2 * u64::from(nr_queues))?;
+
+        let max_members = monitor.max_members.load(Ordering::Acquire);
+        let member_list = monitor.member_list.load(Ordering::Acquire);
+        page_bound.fits_length_at(member_list, u64::from(max_members) * u64::from(8u8))?;
+
+        if max_members > nr_queues {
+            return Err(OpenError);
+        }
+
+        let open_offset = usize::try_from(open_offset)
+            .map_err(|_| OpenError)?;
         let open_ptr = ptr::NonNull::new((ptr.as_ptr() as *mut u8).add(open_offset)).unwrap();
+
         Ok(ShmHeads {
             monitor: ptr,
             open: open_ptr.cast(),

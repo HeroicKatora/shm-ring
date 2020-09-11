@@ -3,6 +3,7 @@ name = "shm-ring"
 version = "0.1.0"
 authors = ["Andreas Molzer <andreas.molzer@gmx.de>"]
 edition = "2018"
+license = "Apache-2.0 OR Unlicense OR WTFPL"
 
 [lib]
 crate-type = ["lib", "cdylib"]

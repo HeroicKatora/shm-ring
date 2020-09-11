@@ -22,7 +22,7 @@ pub struct Cmd(pub u16);
 pub struct ControlMessage {
     /// The operand of the message. For requests the bit use is as follows (high-to-low)
     ///
-    /// ```
+    /// ```text
     /// |   3    |   2    |   1    |   0    |
     /// | First Argument  |        |
     /// |        |        |Command |
@@ -31,7 +31,7 @@ pub struct ControlMessage {
     ///
     /// For responses on the other hand:
     ///
-    /// ```
+    /// ```text
     /// |   3    |   2    |   1    |   0    |
     /// | First Result    |        |
     /// |        |        |Response|
