@@ -50,9 +50,10 @@ mod os_impl;
 
 use core::{cell, mem, ptr, slice};
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use shared_memory::Shmem;
+use atomic::{AtomicMem, Slice};
 
 pub const MEMBER_LIMIT: usize = 256;
 
@@ -111,13 +112,13 @@ pub struct QueueHead {
 /// A reader from a queue.
 pub struct ReadHalf<'queue> {
     inner: &'queue QueueHalf,
-    buffer: &'queue cell::UnsafeCell<[u8]>,
+    buffer: &'queue [AtomicU8],
 }
 
 /// A reader from a queue.
 pub struct WriteHalf<'queue> {
     inner: &'queue QueueHalf,
-    buffer: &'queue cell::UnsafeCell<[u8]>,
+    buffer: &'queue [AtomicU8],
 }
 
 #[repr(C)]
@@ -516,8 +517,8 @@ impl ShmRing {
 
         let write = writer.prepare_write(len).ok_or(SendError)?;
         let (lhs, rhs) = data.split_at(write.unwrapped.len());
-        write.unwrapped.copy_from_slice(lhs);
-        write.wrapped.copy_from_slice(rhs);
+        lhs.copy_to_relaxed(&write.unwrapped);
+        rhs.copy_to_relaxed(&write.wrapped);
         write.commit();
 
         Ok(())
@@ -533,8 +534,8 @@ impl ShmRing {
 
         let read = reader.available(len).ok_or(RecvError)?;
         let (lhs, rhs) = data.split_at_mut(read.unwrapped.len());
-        lhs.copy_from_slice(read.unwrapped);
-        rhs.copy_from_slice(read.wrapped);
+        lhs.copy_from_relaxed(&read.unwrapped);
+        rhs.copy_from_relaxed(&read.wrapped);
         let result = pre_commit(data, read.commit);
         read.commit();
 
@@ -688,7 +689,7 @@ impl ShmQueues {
         let buffer = unsafe {
             let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
             let buffer = ptr::slice_from_raw_parts(addr, OpenOptions::PAGE_SIZE);
-            &*(buffer as *const cell::UnsafeCell<[u8]>)
+            &*(buffer as *const [AtomicU8])
         };
         ReadHalf {
             inner,
@@ -706,7 +707,7 @@ impl ShmQueues {
         let buffer = unsafe {
             let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
             let buffer = ptr::slice_from_raw_parts(addr, OpenOptions::PAGE_SIZE);
-            &*(buffer as *const cell::UnsafeCell<[u8]>)
+            &*(buffer as *const [AtomicU8])
         };
         WriteHalf {
             inner,
@@ -730,8 +731,8 @@ impl QueueHalf {
 struct PreparedRead<'buffer> {
     /// Access to the underlying reader.
     commit: &'buffer ReadHalf<'buffer>,
-    unwrapped: &'buffer [u8],
-    wrapped: &'buffer [u8],
+    unwrapped: AtomicMem<'buffer>,
+    wrapped: AtomicMem<'buffer>,
     read_base: u32,
     read_end: u32,
 }
@@ -739,8 +740,8 @@ struct PreparedRead<'buffer> {
 struct PreparedWrite<'buffer> {
     /// Access to the underlying writer.
     commit: &'buffer WriteHalf<'buffer>,
-    unwrapped: &'buffer mut [u8],
-    wrapped: &'buffer mut [u8],
+    unwrapped: AtomicMem<'buffer>,
+    wrapped: AtomicMem<'buffer>,
     write_base: u32,
     write_end: u32,
 }
@@ -769,25 +770,16 @@ impl ReadHalf<'_> {
         let norm_half = (reader + count).min(modulo);
         let wrap_half = (reader + count).max(modulo) - modulo;
 
-        let buffer = self.buffer.get() as *const u8;
+        let buffer = &self.buffer[..OpenOptions::PAGE_SIZE];
+        let first = &buffer[reader as usize..][..norm_half as usize];
+        let wrapped = &buffer[..wrap_half as usize];
 
-        // SAFETY: synchronized as required. The other thread has release this.
-        let (first, wrapped) = unsafe {
-            // By taking `&mut self` we are indeed the only referent. In particular, the other side
-            // should only write again after we have ACKed this part but we do not allow committing
-            // that while the return value lives.
-            // FIXME: taking borrow on bytes, should probably only take a borrow on the atomic slice.
-            // Do we trust the other side unsafely?
-            let norm = &*slice::from_raw_parts(buffer.add(reader as usize), norm_half as usize);
-            let wrapping = &*slice::from_raw_parts(buffer, wrap_half as usize);
-            (norm, wrapping)
-        };
         Some(PreparedRead {
             commit: &*self,
             read_base: reader,
             read_end: (reader + count) % modulo,
-            unwrapped: first,
-            wrapped,
+            unwrapped: first.into(),
+            wrapped: wrapped.into(),
         })
     }
 }
@@ -795,16 +787,18 @@ impl ReadHalf<'_> {
 impl PreparedRead<'_> {
     /// Atomically remove one value.
     fn controller_u64(&self) -> u64 {
-        let bh = self.unwrapped;
-        let lh = self.wrapped;
+        let bh = &*self.unwrapped;
+        let lh = &*self.wrapped;
 
         // We only ever dequeue 64 at once..
         assert!(bh.is_empty() || lh.is_empty());
         assert_eq!(bh.len() + lh.len(), 8);
-        let bh = <[u8; 8]>::try_from(bh);
-        let lh = <[u8; 8]>::try_from(lh);
+        let bh = <&[AtomicU8; 8]>::try_from(bh);
+        let lh = <&[AtomicU8; 8]>::try_from(lh);
         let val = bh.or(lh).expect("logic bug");
-        u64::from_be_bytes(val)
+        let mut bytes = [0; 8];
+        bytes.copy_from_relaxed(val);
+        u64::from_be_bytes(bytes)
     }
 
     fn commit(self) {
@@ -846,25 +840,18 @@ impl WriteHalf<'_> {
         let norm_half = (writer + count).min(modulo);
         let wrap_half = (writer + count).max(modulo) - modulo;
 
-        let buffer = self.buffer.get() as *mut u8;
+        // SAFETY: synchronized as relaxed so we don't need synchronization to avoid UB. However,
+        // the information is only coherent if the other thread has released this.
+        let buffer = &self.buffer[..OpenOptions::PAGE_SIZE];
+        let first = &buffer[writer as usize..][..norm_half as usize];
+        let wrapped = &buffer[..wrap_half as usize];
 
-        // SAFETY: synchronized as required. The other thread has release this.
-        let (first, wrapped) = unsafe {
-            // By taking `&mut self` we are indeed the only referent. In particular, the other side
-            // should only read the data after we have ACKed this part but we do not allow committing
-            // that while the return value lives.
-            // FIXME: taking mutable borrow, should probably only take a borrow on the atomic slice.
-            // Do we trust the other side unsafely?
-            let norm = &mut *slice::from_raw_parts_mut(buffer.add(writer as usize), norm_half as usize);
-            let wrapping = &mut *slice::from_raw_parts_mut(buffer, wrap_half as usize);
-            (norm, wrapping)
-        };
         Some(PreparedWrite {
             commit: &*self,
             write_base: writer,
             write_end: (writer + count) % modulo,
-            unwrapped: first,
-            wrapped,
+            unwrapped: first.into(),
+            wrapped: wrapped.into(),
         })
     }
 }
@@ -872,17 +859,17 @@ impl WriteHalf<'_> {
 impl PreparedWrite<'_> {
     /// Atomically remove one value.
     fn controller_u64(&mut self, val: u64) {
-        let bh = &mut *self.unwrapped;
-        let lh = &mut *self.wrapped;
+        let bh = &*self.unwrapped;
+        let lh = &*self.wrapped;
 
         // We only ever dequeue 64 at once..
         assert!(bh.is_empty() || lh.is_empty());
         assert_eq!(bh.len() + lh.len(), 8);
         let val = u64::to_be_bytes(val);
-        let bh = <&mut [u8; 8]>::try_from(bh);
-        let lh = <&mut [u8; 8]>::try_from(lh);
+        let bh = <&[AtomicU8; 8]>::try_from(bh);
+        let lh = <&[AtomicU8; 8]>::try_from(lh);
         let buf = bh.or(lh).expect("logic bug");
-        *buf = val;
+        val.copy_to_relaxed(buf);
     }
 
     fn commit(self) {
