@@ -10,21 +10,45 @@ fn main() {
     println!("[.] Allowed methods: {}", client.raw_join_methods());
     println!("[.] Members (now, max): {:?}", client.members());
 
-    let mut server = client
+    let mut client = client
         .join_with(shm_ring::JoinMethod::Futex)
         .connect()
         .unwrap();
     println!("[+] Joined");
 
-    server.request(shm_ring::control::RequestNewRing {
+    // First check that the wrong ID does not give us a server but returns.
+    {
+        client.request(shm_ring::control::ServerJoin {
+            tag: Default::default(),
+            public_id: 0xBAD,
+        }).unwrap();
+
+        loop {
+            match {
+                client.response(|response| {
+                    if let shm_ring::control::Tag(0) = response.tag() {
+                        assert_eq!(response.response(), Cmd::OUT_OF_QUEUES);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            } {
+                Ok(false) | Err(_) => {},
+                Ok(true) => break,
+            }
+        };
+    }
+
+    client.request(shm_ring::control::ServerJoin {
         tag: Default::default(),
         public_id: 0xD,
     }).unwrap();
     println!("[+] Server request has been sent");
 
-    let (kind, listen) = loop {
+    let (kind, queue) = loop {
         match {
-            server.response(|response| {
+            client.response(|response| {
                 if let shm_ring::control::Tag(0) = response.tag() {
                     Some((response.response(), response.value0()))
                 } else {
@@ -48,14 +72,14 @@ fn main() {
     }
 
     if kind == Cmd::OUT_OF_QUEUES {
-        println!("[-] No more queues.");
+        println!("[-] No server available.");
         std::process::exit(1);
     }
-    
-    assert_eq!(kind, Cmd::REQUEST_NEW_RING);
-    println!("[+] Granted {}", listen);
+
+    println!("[+] Server found {}", queue);
 
     loop {
         // TODO: echo back all bytes received on the control ring
     }
 }
+

@@ -1,4 +1,4 @@
-use super::{Events, ReadHalf, ShmController, ShmQueues};
+use super::{Events, OpenQueue, ReadHalf, ShmController, ShmQueue};
 
 /// A tag is an identifier for a pending request.
 ///
@@ -49,17 +49,34 @@ pub struct ControlResponse<'ring> {
     ring: &'ring ReadHalf<'ring>,
 }
 
-/// Request a new ring.
+/// Request a new ring as a server (queue head A).
+///
+/// The `public_id` is used as the first argument.
 pub struct RequestNewRing {
-    pub payload: Tag,
+    /// An identifier with which other clients can request this ring.
+    /// The method of discovering which id to use is out-of-scope for the shm-controller itself. A
+    /// useful mechanism for statically determined networks may be unique IDs.
+    pub public_id: u32,
+    /// The tag identifying the request.
+    pub tag: Tag,
+}
+
+/// Join a ring with a public id as a client (queue head B).
+pub struct ServerJoin {
+    /// The identifier that was used when creating the server.
+    /// When this matches multiple servers then any of these is chosen (Internally, the first.. But
+    /// this detail is not yet stable. Don't rely on the order yet).
+    pub public_id: u32,
+    /// The tag identifying the request.
+    pub tag: Tag,
 }
 
 /// Answer to a requested ring.
 pub struct ProvideNewRing {
     /// Offset of the head control structure (hint: the requester is partner A).
     pub head: u32,
-    /// The payload sent.
-    pub payload: Tag,
+    /// The tag identifying the request.
+    pub tag: Tag,
 }
 
 /// Send a parameterless ping.
@@ -71,8 +88,10 @@ impl Cmd {
     pub const BAD: Self = Cmd(!0);
     pub const UNIMPLEMENTED: Self = Cmd(!0 - 1);
     pub const OUT_OF_QUEUES: Self = Cmd(!0 - 2);
+
     pub const REQUEST_NEW_RING: Self = Cmd(1);
     pub const REQUEST_PING: Self = Cmd(2);
+    pub const SERVER_JOIN: Self = Cmd(3);
 }
 
 impl ControlMessage {
@@ -81,6 +100,12 @@ impl ControlMessage {
     /// Exists for document purposes, see the list of implementors of `Into` and `From`.
     pub fn new(msg: impl Into<Self>) -> Self {
         msg.into()
+    }
+
+    /// Add an argument to the control message. See message encoding.
+    pub fn with_argument(self, val: u32) -> Self {
+        // Same encoding..
+        self.with_result(val)
     }
 
     fn with_raw(Cmd(op): Cmd, Tag(tag): Tag) -> Self {
@@ -100,11 +125,15 @@ impl ControlMessage {
     fn cmd(self) -> Cmd {
         Cmd((self.op >> 16) as u16)
     }
+
+    fn value0(self) -> u32 {
+        (self.op >> 32) as u32
+    }
 }
 
 impl From<RequestNewRing> for ControlMessage {
-    fn from(RequestNewRing { payload }: RequestNewRing) -> Self {
-        ControlMessage::with_raw(Cmd::REQUEST_NEW_RING, payload)
+    fn from(RequestNewRing { tag, public_id }: RequestNewRing) -> Self {
+        ControlMessage::with_raw(Cmd::REQUEST_NEW_RING, tag).with_argument(public_id)
     }
 }
 
@@ -114,15 +143,26 @@ impl From<Ping> for ControlMessage {
     }
 }
 
+impl From<ServerJoin> for ControlMessage {
+    fn from(ServerJoin { tag, public_id }: ServerJoin) -> Self {
+        ControlMessage::with_raw(Cmd::SERVER_JOIN, tag).with_argument(public_id)
+    }
+}
+
 /// Private implementation of commands.
 impl ControlMessage {
-    pub(crate) fn execute(controller: &mut ShmController, mut queue: ShmQueues, mut events: Option<&mut Events>) {
-        if queue.half_to_write_to().prepare_write(8).is_none() {
+    pub(crate) fn execute(
+        controller: &mut ShmController,
+        mut queue: ShmQueue<'_>,
+        mut events: Option<&mut Events>,
+    ) {
+        let queues = &mut queue.queues;
+        if queues.half_to_write_to().prepare_write(8).is_none() {
             // No space for response. Don't.
             return;
         }
 
-        let mut reader = queue.half_to_read_from();
+        let mut reader = queues.half_to_read_from();
         if let Some(available) = reader.available(8) {
             let op = available.controller_u64();
             let msg = ControlMessage { op };
@@ -133,19 +173,43 @@ impl ControlMessage {
             let (mut op, extra_space);
             match cmd {
                 Cmd::REQUEST_PING => {
-                    op = Cmd::REQUEST_PING;
                     extra_space = 0;
+                    op = Cmd::REQUEST_PING;
                 }
-                _ => {
-                    let queues = &mut controller.state.free_queues;
-                    if let Some(queue) = queues.pop() {
+                Cmd::REQUEST_NEW_RING => {
+                    extra_space = 0;
+
+                    let queue = controller.state.free_queues.pop();
+
+                    if let Some(queue) = queue {
+                        controller.state.open_server.push(OpenQueue {
+                            queue,
+                            user_tag: msg.value0(),
+                        });
                         op = Cmd::REQUEST_NEW_RING;
                         result = queue;
                     } else {
                         op = Cmd::OUT_OF_QUEUES;
                     }
-
+                }
+                Cmd::SERVER_JOIN => {
                     extra_space = 0;
+
+                    let matching = controller.state.open_server.iter().position(|open| {
+                        open.user_tag == msg.value0()
+                    });
+
+                    if let Some(matching) = matching {
+                        let queue = controller.state.open_server.remove(matching).queue;
+                        op = Cmd::REQUEST_NEW_RING;
+                        result = queue;
+                    } else {
+                        op = Cmd::OUT_OF_QUEUES;
+                    }
+                }
+                _ => {
+                    extra_space = 0;
+                    op = Cmd::UNIMPLEMENTED;
                 }
             };
             if extra_space > 0 {
@@ -155,7 +219,7 @@ impl ControlMessage {
             available.commit();
 
             let answer = ControlMessage::with_raw(op, tag).with_result(result);
-            let mut writer = queue.half_to_write_to();
+            let mut writer = queues.half_to_write_to();
             let mut write = writer.prepare_write(8).unwrap();
             write.controller_u64(answer.op);
             write.commit();
@@ -187,6 +251,6 @@ impl<'ring> ControlResponse<'ring> {
     }
 
     pub fn value0(&self) -> u32 {
-        (self.msg.op >> 32) as u32
+        self.msg.value0()
     }
 }

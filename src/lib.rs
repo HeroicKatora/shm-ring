@@ -79,7 +79,7 @@ mod os_impl;
 #[path = "windows.rs"]
 mod os_impl;
 
-use core::{cell, mem, ptr, slice};
+use core::{cell, marker, mem, ptr, slice};
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU8, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
@@ -99,11 +99,6 @@ pub struct MonitorHead {
     pub magic: AtomicU32,
     /// Static version of this header structure.
     pub version: AtomicU32,
-    /// A bit-mask of available methods for opening a new handle.
-    /// `0x00000001`: wait by reading from a named pipe
-    /// `0x00000002`: futex based waiting using the futex in the head (?? WIP details)
-    /// `0x00000004`: wait using an semaphore (?? WIP details)
-    pub open_with: AtomicU32,
     /// File-relative address of the page for new process to join.
     pub open_page: AtomicU64,
     /// File-relative address of the first page used by queue heads.
@@ -112,6 +107,13 @@ pub struct MonitorHead {
     pub queue_start: AtomicU64,
     /// File-relative address of the first page used for shared memory of queues.
     pub scratch_start: AtomicU64,
+    /// A bit-mask of available methods for opening a new handle.
+    /// `0x00000001`: wait by reading from a named pipe
+    /// `0x00000002`: futex based waiting using the futex in the head (?? WIP details)
+    /// `0x00000004`: wait using an semaphore (?? WIP details)
+    pub open_with: AtomicU32,
+    /// The number of available queues in total.
+    pub nr_queues: AtomicU32,
     /// The number of current members.
     pub members: AtomicU32,
     /// The maximal number of members.
@@ -212,6 +214,12 @@ pub struct ShmController {
 
 struct ControllerState {
     free_queues: Vec<u32>,
+    open_server: Vec<OpenQueue>,
+}
+
+struct OpenQueue {
+    queue: u32,
+    user_tag: u32,
 }
 
 pub struct Events {
@@ -241,10 +249,14 @@ pub struct ShmClient {
 }
 
 /// A single queue in the ring.
-/// IMPORTANT: This is an owning structure of this half of the queue, which is a safety
-/// invariant. You must not call methods other than `reverse` on the half you do not own. Otherwise
-/// the read or write buffer might be out-of-sync of the synchronized range of bytes in the
-/// respective queues.
+///
+/// This assumes that the ring is alive and the pointers are all correct! Further it helps avoid
+/// client errors from incorrectly assuming to be the owner of a queue. It's not that this could
+/// lead to bad UB but rather that it could produce confusing state such a publishing a request
+/// before all its information was written into the send queue half.
+///
+/// In other words, if you have more than one queue then the read or write heads might become
+/// out-of-sync of the assumed range of bytes in the respective queues.
 struct ShmQueues {
     private_head: ptr::NonNull<QueueHead>,
     private_queues: ptr::NonNull<u64>,
@@ -259,14 +271,25 @@ pub struct ShmRing {
     queues: ShmQueues,
 }
 
+pub struct ShmQueue<'shared_is_alive> {
+    _lt: marker::PhantomData<& 'shared_is_alive ShmRing>,
+    heads: ShmHeads,
+    queues: ShmQueues,
+}
+
 /// An active connection to the controller.
 pub struct ShmControllerRing {
+    /// The ring connecting to the controller.
     pub ring: ShmRing,
     /// The client id owned by this ring.
     this: u32,
     /// The pid we registered..
     pid: u64,
     _private: (),
+}
+
+pub struct TrustedQueues<'shared_is_alive> {
+    inner: &'shared_is_alive ShmControllerRing,
 }
 
 /// An active connection to another client.
@@ -399,6 +422,7 @@ impl OpenOptions {
         monitor.queue_start.store(first_queue * Self::PAGE_SIZE as u64, Ordering::Release);
         let first_heap = first_queue + 2 * u64::from(self.num_rings);
         monitor.scratch_start.store(first_heap * Self::PAGE_SIZE as u64, Ordering::Release);
+        monitor.nr_queues.store(self.num_rings, Ordering::Release);
         monitor.members.store(0, Ordering::Release);
         monitor.max_members.store(self.max_members, Ordering::Release);
         // For now, starts directly behind head.
@@ -454,7 +478,7 @@ impl ShmController {
                 events.who_joined_on(who, request);
             }
 
-            self.heads.queues_controller(request).reset();
+            self.heads.queues_controller(request).queues.reset();
             self.monitor().members.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -462,7 +486,8 @@ impl ShmController {
     fn handle_client_queues(&mut self, mut events: Option<&mut Events>) {
         let clients = self.monitor().max_members.load(Ordering::Relaxed);
         for i in 0..clients {
-            let queue = self.heads.queues_controller(i);
+            let heads = self.heads;
+            let queue = heads.queues_controller(i);
             let events = events.as_mut().map(|e| &mut **e);
             control::ControlMessage::execute(self, queue, events);
         }
@@ -485,6 +510,7 @@ impl ControllerState {
     fn new(config: &OpenOptions, _: &ShmHeads) -> Box<Self> {
         Box::new(ControllerState {
             free_queues: (config.max_members..config.num_rings).collect(),
+            open_server: vec![],
         })
     }
 }
@@ -554,7 +580,7 @@ impl ShmClient {
         let this = queue?;
 
         let ring = ShmRing {
-            queues: self.heads.queues_controller(this).reverse(),
+            queues: self.heads.queues_controller(this).reverse().queues,
             shared: self.shared,
             heads: self.heads,
         };
@@ -622,6 +648,26 @@ impl JoinMethod {
 }
 
 impl ShmRing {
+    /// Clone the queue, which we borrow for the lifetime.
+    ///
+    /// Since we borrow ourselves mutably and the exposed type requires mutable references as well,
+    /// this will only do the expected things.
+    pub fn queue(&mut self) -> ShmQueue<'_> {
+        self.queue_from_ref()
+    }
+
+    /// Do the same as queue but allows multiple refs.
+    /// You must call this through a `Trusted*` interface for your own sanity's sake.
+    pub(crate) fn queue_from_ref(&self) -> ShmQueue<'_> {
+        ShmQueue {
+            _lt: marker::PhantomData,
+            heads: self.heads,
+            queues: self.queues.get_a_clone_okay_just_give_me(),
+        }
+    }
+}
+
+impl ShmQueue<'_> {
     /// Send one chunk of data.
     pub fn send(&mut self, data: &[u8]) -> Result<(), SendError> {
         self.send_with(data, |_, _| ())
@@ -677,6 +723,14 @@ impl ShmRing {
 
         Ok(result)
     }
+
+    pub(crate) fn reverse(self) -> Self {
+        ShmQueue {
+            queues: self.queues.reverse(),
+            ..self
+        }
+    }
+
 }
 
 impl ShmControllerRing {
@@ -685,20 +739,55 @@ impl ShmControllerRing {
         self.this
     }
 
+    /// Get an intermediate with which you can access another queue.
+    ///
+    /// Other queues may be those that were granted by the controller or those which this client
+    /// joined.
+    ///
+    /// This relies on the fact that accessing another's queue (or another accessing ours) is not
+    /// fundamentally unsound. If you use the wrong queue you may cause a large amount of chaos but
+    /// it won't be UB directly. Please don't do it.
+    pub fn trust_me_with_all_queues(&self) -> TrustedQueues<'_> {
+        TrustedQueues { inner: &self }
+    }
+
+
     /// Send a request to the controller.
     pub fn request(&mut self, msg: impl Into<control::ControlMessage>) -> Result<(), SendError> {
         let msg = msg.into().op.to_be_bytes();
-        self.ring.send(&msg)
+        self.ring.queue().send(&msg)
     }
 
     /// Receive one response if there is one available.
     pub fn response<T>(&mut self, handler: impl FnOnce(control::ControlResponse) -> T) -> Result<T, RecvError> {
         let mut op = [0; 8];
-        self.ring.recv_with(&mut op, |filled, ring| {
+        self.ring.queue().recv_with(&mut op, |filled, ring| {
             let op = <&mut [u8; 8]>::try_from(filled).unwrap();
             let resp = control::ControlResponse::new(ring, *op);
             handler(resp)
         })
+    }
+}
+
+impl<'shared_is_alive> TrustedQueues<'shared_is_alive> {
+    pub fn as_server(&self, id: u32) -> ShmQueue<'shared_is_alive> {
+        let ring = &self.inner.ring;
+
+        // Just a sanity test. This shouldn't refer to a member queue which can not be the server.
+        let members = ring.heads.monitor().max_members.load(Ordering::Relaxed);
+        assert!(members < id, "That queue belongs to a member. Call as_member instead.");
+
+        ring.heads.queues_controller(id)
+    }
+
+    pub fn as_client(&self, id: u32) -> ShmQueue<'shared_is_alive> {
+        let ring = &self.inner.ring;
+
+        // Just a sanity test. This shouldn't refer to a member queue which can not be the server.
+        let members = ring.heads.monitor().max_members.load(Ordering::Relaxed);
+        assert!(members < id, "That queue belongs to a member. Call as_member instead.");
+
+        ring.heads.queues_controller(id).reverse()
     }
 }
 
@@ -717,6 +806,7 @@ impl ShmHeads {
             open: open_ptr.cast(),
         })
     }
+
     pub(crate) fn monitor(&self) -> &MonitorHead {
         assert!(mem::size_of::<MonitorHead>() <= OpenOptions::PAGE_SIZE);
         unsafe { &*(self.monitor.as_ptr() as *const MonitorHead) }
@@ -737,6 +827,21 @@ impl ShmHeads {
             // SAFETY: surely short enough, and enough space for max_members as validated above.
             let memlist = (base as *const MonitorHead).add(1) as *const AtomicU64;
             slice::from_raw_parts(memlist, max_members)
+        }
+    }
+
+    /// Safe version of raw_queues_controller, does the invariant checks.
+    pub(crate) fn queues_controller(&self, this: u32) -> ShmQueue<'_> {
+        let nr_queues = self.monitor().nr_queues.load(Ordering::Relaxed);
+        assert!(this < nr_queues, "That queue does not exist.");
+        // Safety:
+        // * The val does not outlive self which outlives the shared memory.
+        // * We've just asserted it is a valid queue.
+        let queues = unsafe { self.raw_queues_controller(this) };
+        ShmQueue {
+            _lt: marker::PhantomData,
+            heads: *self,
+            queues,
         }
     }
 
@@ -773,8 +878,13 @@ impl ShmHeads {
         }
     }
 
-    /// FIXME: should we make this unsafe? Returned value assumes to own that side of the queue.
-    fn queues_controller(&self, this: u32) -> ShmQueues {
+    /// Create a pair of queues.
+    ///
+    /// # Safety
+    ///
+    /// * The pair must not outlive the shared memory.
+    /// * The `this` index must be smaller than the `nr_queues`.
+    unsafe fn raw_queues_controller(&self, this: u32) -> ShmQueues {
         let (private_head, private_queues, private_mem);
         // FIXME: validated pointers? We trust the server but it's a precaution against
         // alternative implementations that are wrong..
@@ -805,6 +915,14 @@ impl ShmQueues {
             is_a_side: !self.is_a_side,
             ..self
         }
+    }
+
+    /// Call when you're sure it's fine to clone this.
+    ///
+    /// For example because the original is borrowed for the lifetime of the returned value or
+    /// because the queue has been assumed to have been transferred to us.
+    fn get_a_clone_okay_just_give_me(&self) -> Self {
+        ShmQueues { ..*self }
     }
 
     fn head(&self) -> &QueueHead {
