@@ -622,7 +622,20 @@ impl JoinMethod {
 }
 
 impl ShmRing {
+    /// Send one chunk of data.
     pub fn send(&mut self, data: &[u8]) -> Result<(), SendError> {
+        self.send_with(data, |_, _| ())
+    }
+
+    /// Send one chunk of data with a callback on success before committing.
+    ///
+    /// The callback may perform more expensive work that can be elided in the unsuccessful cases.
+    /// It is only called when enough buffer space was available.
+    pub fn send_with<T>(
+        &mut self,
+        data: &[u8],
+        pre_commit: impl FnOnce(&[u8], &WriteHalf) -> T,
+    ) -> Result<T, SendError> {
         let len = u32::try_from(data.len()).map_err(|_| SendError)?;
         let mut writer = self.queues.half_to_write_to();
 
@@ -630,15 +643,27 @@ impl ShmRing {
         let (lhs, rhs) = data.split_at(write.unwrapped.len());
         lhs.copy_to_relaxed(&write.unwrapped);
         rhs.copy_to_relaxed(&write.wrapped);
+        let result = pre_commit(data, write.commit);
         write.commit();
 
-        Ok(())
+        Ok(result)
     }
 
-    pub fn recv<T>(
+    /// Receive one chunk of data.
+    pub fn recv(&mut self, data: &mut [u8]) -> Result<(), RecvError> {
+        self.recv_with(data, |_, _| ())
+    }
+
+    /// Receive one chunk of data, with some code that can run before the receive is committed.
+    ///
+    /// This allows one to read auxiliary data from the associated memory (or some other location)
+    /// before the other side of the queue assumes that the request has been handled and
+    /// potentially updates the data. Note that none of reads/writes should be races but the
+    /// results would be unexpected or corrupted.
+    pub fn recv_with<T>(
         &mut self,
         data: &mut [u8],
-        pre_commit: impl FnOnce(&mut [u8], &ReadHalf) -> T
+        pre_commit: impl FnOnce(&mut [u8], &ReadHalf) -> T,
     ) -> Result<T, RecvError> {
         let len = u32::try_from(data.len()).map_err(|_| RecvError)?;
         let mut reader = self.queues.half_to_read_from();
@@ -655,18 +680,21 @@ impl ShmRing {
 }
 
 impl ShmControllerRing {
+    /// The id of this client (and its ring).
     pub fn client_id(&self) -> u32 {
         self.this
     }
 
+    /// Send a request to the controller.
     pub fn request(&mut self, msg: impl Into<control::ControlMessage>) -> Result<(), SendError> {
         let msg = msg.into().op.to_be_bytes();
         self.ring.send(&msg)
     }
 
+    /// Receive one response if there is one available.
     pub fn response<T>(&mut self, handler: impl FnOnce(control::ControlResponse) -> T) -> Result<T, RecvError> {
         let mut op = [0; 8];
-        self.ring.recv(&mut op, |filled, ring| {
+        self.ring.recv_with(&mut op, |filled, ring| {
             let op = <&mut [u8; 8]>::try_from(filled).unwrap();
             let resp = control::ControlResponse::new(ring, *op);
             handler(resp)
