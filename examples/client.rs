@@ -91,5 +91,13 @@ fn main() {
             break;
         }
     }
+
+    let queue = queue.queue_id();
+
+    // Leave the server queue, gives it up to another client.
+    while let Err(_) = client.request(shm_ring::control::LeaveRing {
+        tag: Default::default(),
+        queue,
+    }) { };
 }
 

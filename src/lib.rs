@@ -302,12 +302,14 @@ pub struct ShmRing {
     shared: Shmem,
     heads: ShmHeads,
     queues: ShmQueues,
+    queue_id: u32,
 }
 
 pub struct ShmQueue<'shared_is_alive> {
     _lt: marker::PhantomData<& 'shared_is_alive ShmRing>,
     heads: ShmHeads,
     queues: ShmQueues,
+    id: u32,
 }
 
 /// An active connection to the controller.
@@ -645,6 +647,7 @@ impl ShmClient {
             queues: self.heads.queues_controller(this).reverse().queues,
             shared: self.shared,
             heads: self.heads,
+            queue_id: this,
         };
 
         Ok(ShmControllerRing {
@@ -725,6 +728,7 @@ impl ShmRing {
             _lt: marker::PhantomData,
             heads: self.heads,
             queues: self.queues.get_a_clone_okay_just_give_me(),
+            id: self.queue_id,
         }
     }
 }
@@ -784,6 +788,11 @@ impl ShmQueue<'_> {
         read.commit();
 
         Ok(result)
+    }
+
+    /// Get the id that identifies the queue in the `shm-ring`.
+    pub fn queue_id(&self) -> u32 {
+        self.id
     }
 
     pub(crate) fn reverse(self) -> Self {
@@ -959,6 +968,7 @@ impl ShmHeads {
             _lt: marker::PhantomData,
             heads: *self,
             queues,
+            id: this,
         }
     }
 

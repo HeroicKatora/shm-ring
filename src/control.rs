@@ -1,4 +1,4 @@
-use super::{ActiveQueue, Events, OpenServer, ReadHalf, ShmController, ShmQueue};
+use super::{ActiveQueue, Events, OpenClient, OpenServer, ReadHalf, ShmController, ShmQueue};
 
 /// A tag is an identifier for a pending request.
 ///
@@ -71,10 +71,10 @@ pub struct ServerJoin {
     pub tag: Tag,
 }
 
-/// Answer to a requested ring.
-pub struct ProvideNewRing {
-    /// Offset of the head control structure (hint: the requester is partner A).
-    pub head: u32,
+/// Purposefully leave a ring.
+pub struct LeaveRing {
+    /// The queue ID that you want to leave.
+    pub queue: u32,
     /// The tag identifying the request.
     pub tag: Tag,
 }
@@ -157,6 +157,12 @@ impl From<ServerJoin> for ControlMessage {
     }
 }
 
+impl From<LeaveRing> for ControlMessage {
+    fn from(LeaveRing { tag, queue }: LeaveRing) -> Self {
+        ControlMessage::with_raw(Cmd::LEAVE, tag).with_argument(queue)
+    }
+}
+
 /// Private implementation of commands.
 impl ControlMessage {
     pub(crate) fn execute(
@@ -220,6 +226,41 @@ impl ControlMessage {
 
                         op = Cmd::REQUEST_NEW_RING;
                         result = open.queue;
+                    } else {
+                        op = Cmd::OUT_OF_QUEUES;
+                    }
+                }
+                Cmd::LEAVE => {
+                    extra_space = 0;
+
+                    let matching = controller.state.active.iter().position(|active| {
+                        active.queue == msg.value0()
+                    });
+
+                    if let Some(matching) = matching {
+                        if controller.state.active[matching].a == queue_owner {
+                            let active = controller.state.active.remove(matching);
+                            controller.state.open_client.push(OpenClient {
+                                queue: active.queue,
+                                user_tag: active.user_tag,
+                                b: active.b,
+                            });
+
+                            op = Cmd::LEAVE;
+                        } else if controller.state.active[matching].b == queue_owner {
+                            let active = controller.state.active.remove(matching);
+                            controller.state.open_server.push(OpenServer {
+                                queue: active.queue,
+                                user_tag: active.user_tag,
+                                a: active.a,
+                            });
+
+                            op = Cmd::LEAVE;
+                        } else {
+                            // This message from the wrong person. Just don't do anything, but
+                            // answer something to make them aware.
+                            op = Cmd::OUT_OF_QUEUES;
+                        }
                     } else {
                         op = Cmd::OUT_OF_QUEUES;
                     }
