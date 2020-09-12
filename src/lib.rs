@@ -228,12 +228,31 @@ pub struct ShmController {
 
 struct ControllerState {
     free_queues: Vec<u32>,
-    open_server: Vec<OpenQueue>,
+    open_server: Vec<OpenServer>,
+    open_client: Vec<OpenClient>,
+    active: Vec<ActiveQueue>,
 }
 
-struct OpenQueue {
+/// A queue opened only on the server (A) side.
+struct OpenServer {
     queue: u32,
     user_tag: u32,
+    a: u32,
+}
+
+/// A queue opened only on the client (A) side, i.e. pending request.
+struct OpenClient {
+    queue: u32,
+    user_tag: u32,
+    b: u32,
+}
+
+/// A queue with both sides alive.
+struct ActiveQueue {
+    queue: u32,
+    user_tag: u32,
+    a: u32,
+    b: u32,
 }
 
 pub struct Events {
@@ -530,7 +549,7 @@ impl ShmController {
             let heads = self.heads;
             let queue = heads.queues_controller(i);
             let events = events.as_mut().map(|e| &mut **e);
-            control::ControlMessage::execute(self, queue, events);
+            control::ControlMessage::execute(self, i, queue, events);
         }
     }
 
@@ -552,6 +571,8 @@ impl ControllerState {
         Box::new(ControllerState {
             free_queues: (config.max_members..config.num_rings).collect(),
             open_server: vec![],
+            active: vec![],
+            open_client: vec![],
         })
     }
 }
@@ -771,7 +792,6 @@ impl ShmQueue<'_> {
             ..self
         }
     }
-
 }
 
 impl ShmControllerRing {

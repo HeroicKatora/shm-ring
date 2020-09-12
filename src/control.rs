@@ -1,4 +1,4 @@
-use super::{Events, OpenQueue, ReadHalf, ShmController, ShmQueue};
+use super::{ActiveQueue, Events, OpenServer, ReadHalf, ShmController, ShmQueue};
 
 /// A tag is an identifier for a pending request.
 ///
@@ -89,9 +89,17 @@ impl Cmd {
     pub const UNIMPLEMENTED: Self = Cmd(!0 - 1);
     pub const OUT_OF_QUEUES: Self = Cmd(!0 - 2);
 
+    /// Create a new ring as a server.
     pub const REQUEST_NEW_RING: Self = Cmd(1);
+    /// A ping will immediately be answered by a ping back.
     pub const REQUEST_PING: Self = Cmd(2);
+    /// A client connection to an existing server.
     pub const SERVER_JOIN: Self = Cmd(3);
+    /// Advertise a server host, but do not yet create a queue.
+    /// More or less a listening socket.
+    pub const SERVER_HOST: Self = Cmd(4);
+    /// Remove ourselves from a channel, giving the spot up.
+    pub const LEAVE: Self = Cmd(5);
 }
 
 impl ControlMessage {
@@ -153,6 +161,7 @@ impl From<ServerJoin> for ControlMessage {
 impl ControlMessage {
     pub(crate) fn execute(
         controller: &mut ShmController,
+        queue_owner: u32,
         mut queue: ShmQueue<'_>,
         mut events: Option<&mut Events>,
     ) {
@@ -182,9 +191,10 @@ impl ControlMessage {
                     let queue = controller.state.free_queues.pop();
 
                     if let Some(queue) = queue {
-                        controller.state.open_server.push(OpenQueue {
+                        controller.state.open_server.push(OpenServer {
                             queue,
                             user_tag: msg.value0(),
+                            a: queue_owner,
                         });
                         op = Cmd::REQUEST_NEW_RING;
                         result = queue;
@@ -200,16 +210,26 @@ impl ControlMessage {
                     });
 
                     if let Some(matching) = matching {
-                        let queue = controller.state.open_server.remove(matching).queue;
+                        let open = controller.state.open_server.remove(matching);
+                        controller.state.active.push(ActiveQueue {
+                            queue: open.queue,
+                            user_tag: open.user_tag,
+                            a: open.a,
+                            b: queue_owner,
+                        });
+
                         op = Cmd::REQUEST_NEW_RING;
-                        result = queue;
+                        result = open.queue;
                     } else {
                         op = Cmd::OUT_OF_QUEUES;
                     }
                 }
                 _ => {
                     extra_space = 0;
-                    op = Cmd::UNIMPLEMENTED;
+                    op = match cmd {
+                        Cmd::SERVER_HOST | Cmd::LEAVE => Cmd::UNIMPLEMENTED,
+                        _ => Cmd::BAD,
+                    };
                 }
             };
             if extra_space > 0 {
