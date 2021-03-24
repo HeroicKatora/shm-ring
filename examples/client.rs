@@ -1,6 +1,6 @@
 /// An echo server attaching itself to a controller.
 use std::path::Path;
-use shm_ring::{self, control::Cmd};
+use shm_ring::{self, control::Cmd, ShmRingId};
 
 fn main() {
     let client = shm_ring::OpenOptions::new()
@@ -61,6 +61,8 @@ fn main() {
         }
     };
 
+    let queue = ShmRingId(queue);
+
     if kind == Cmd::BAD {
         println!("[-] Bad request?");
         std::process::exit(1);
@@ -76,8 +78,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("[+] Server found {}", queue);
-    let msg: [u8; 1] = [queue as u8; 1];
+    println!("[+] Server found {}", queue.0);
+    let msg: [u8; 1] = [queue.0 as u8; 1];
     let mut queue = client.trust_me_with_all_queues().as_client(queue);
 
     queue.send(&msg).expect("No more space?");
@@ -97,7 +99,7 @@ fn main() {
     // Leave the server queue, gives it up to another client.
     while let Err(_) = client.request(shm_ring::control::LeaveRing {
         tag: Default::default(),
-        queue,
+        queue: queue.0,
     }) { };
 }
 

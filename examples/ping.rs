@@ -15,7 +15,7 @@ fn main() {
         .connect()
         .unwrap();
 
-    println!("[+] Joined @{}", connection.client_id());
+    println!("[+] Joined @{:?}", connection.client_id());
 
     connection.request(shm_ring::control::Ping {
         payload: shm_ring::control::Tag(0x42),

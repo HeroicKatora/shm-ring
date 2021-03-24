@@ -1,6 +1,6 @@
 /// An echo server attaching itself to a controller.
 use std::path::Path;
-use shm_ring::{self, control::Cmd};
+use shm_ring::{self, control::Cmd, ShmRingId};
 
 fn main() {
     let client = shm_ring::OpenOptions::new()
@@ -54,7 +54,9 @@ fn main() {
     
     assert_eq!(kind, Cmd::REQUEST_NEW_RING);
     println!("[+] Granted {}", listen);
-    let mut queue = server.trust_me_with_all_queues().as_server(listen);
+    let mut queue = server
+        .trust_me_with_all_queues()
+        .as_server(ShmRingId(listen));
 
     let ref mut buffer = [0u8; 1];
     loop {

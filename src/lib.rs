@@ -302,14 +302,14 @@ pub struct ShmRing {
     shared: Shmem,
     heads: ShmHeads,
     queues: ShmQueues,
-    queue_id: u32,
+    queue_id: ShmRingId,
 }
 
 pub struct ShmQueue<'shared_is_alive> {
     _lt: marker::PhantomData<& 'shared_is_alive ShmRing>,
     heads: ShmHeads,
     queues: ShmQueues,
-    id: u32,
+    id: ShmRingId,
 }
 
 /// An active connection to the controller.
@@ -317,11 +317,14 @@ pub struct ShmControllerRing {
     /// The ring connecting to the controller.
     pub ring: ShmRing,
     /// The client id owned by this ring.
-    this: u32,
+    this: ShmRingId,
     /// The pid we registered..
     pid: u64,
     _private: (),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShmRingId(pub u32);
 
 pub struct TrustedQueues<'shared_is_alive> {
     inner: &'shared_is_alive ShmControllerRing,
@@ -540,7 +543,7 @@ impl ShmController {
                 events.who_joined_on(who, request);
             }
 
-            self.heads.queues_controller(request).queues.reset();
+            self.heads.queues_controller(ShmRingId(request)).queues.reset();
             self.monitor().members.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -549,7 +552,7 @@ impl ShmController {
         let clients = self.monitor().max_members.load(Ordering::Relaxed);
         for i in 0..clients {
             let heads = self.heads;
-            let queue = heads.queues_controller(i);
+            let queue = heads.queues_controller(ShmRingId(i));
             let events = events.as_mut().map(|e| &mut **e);
             control::ControlMessage::execute(self, i, queue, events);
         }
@@ -641,7 +644,7 @@ impl ShmClient {
             JoinMethod::Futex => os_impl::futex(&self, want),
         };
 
-        let this = queue?;
+        let this = ShmRingId(queue?);
 
         let ring = ShmRing {
             queues: self.heads.queues_controller(this).reverse().queues,
@@ -791,7 +794,7 @@ impl ShmQueue<'_> {
     }
 
     /// Get the id that identifies the queue in the `shm-ring`.
-    pub fn queue_id(&self) -> u32 {
+    pub fn queue_id(&self) -> ShmRingId {
         self.id
     }
 
@@ -805,7 +808,7 @@ impl ShmQueue<'_> {
 
 impl ShmControllerRing {
     /// The id of this client (and its ring).
-    pub fn client_id(&self) -> u32 {
+    pub fn client_id(&self) -> ShmRingId {
         self.this
     }
 
@@ -840,22 +843,22 @@ impl ShmControllerRing {
 }
 
 impl<'shared_is_alive> TrustedQueues<'shared_is_alive> {
-    pub fn as_server(&self, id: u32) -> ShmQueue<'shared_is_alive> {
+    pub fn as_server(&self, id: ShmRingId) -> ShmQueue<'shared_is_alive> {
         let ring = &self.inner.ring;
 
         // Just a sanity test. This shouldn't refer to a member queue which can not be the server.
         let members = ring.heads.monitor().max_members.load(Ordering::Relaxed);
-        assert!(members < id, "That queue belongs to a member. Call as_member instead.");
+        assert!(members < id.0, "That queue belongs to a member. Call as_member instead.");
 
         ring.heads.queues_controller(id)
     }
 
-    pub fn as_client(&self, id: u32) -> ShmQueue<'shared_is_alive> {
+    pub fn as_client(&self, id: ShmRingId) -> ShmQueue<'shared_is_alive> {
         let ring = &self.inner.ring;
 
         // Just a sanity test. This shouldn't refer to a member queue which can not be the server.
         let members = ring.heads.monitor().max_members.load(Ordering::Relaxed);
-        assert!(members < id, "That queue belongs to a member. Call as_member instead.");
+        assert!(members < id.0, "That queue belongs to a member. Call as_member instead.");
 
         ring.heads.queues_controller(id).reverse()
     }
@@ -957,9 +960,9 @@ impl ShmHeads {
     }
 
     /// Safe version of raw_queues_controller, does the invariant checks.
-    pub(crate) fn queues_controller(&self, this: u32) -> ShmQueue<'_> {
+    pub(crate) fn queues_controller(&self, this: ShmRingId) -> ShmQueue<'_> {
         let nr_queues = self.monitor().nr_queues.load(Ordering::Relaxed);
-        assert!(this < nr_queues, "That queue does not exist.");
+        assert!(this.0 < nr_queues, "That queue does not exist.");
         // Safety:
         // * The val does not outlive self which outlives the shared memory.
         // * We've just asserted it is a valid queue.
@@ -972,33 +975,33 @@ impl ShmHeads {
         }
     }
 
-    fn head_start(&self, this: u32) -> ptr::NonNull<QueueHead> {
+    fn head_start(&self, this: ShmRingId) -> ptr::NonNull<QueueHead> {
         let base = self.monitor.as_ptr() as *mut u8;
 
         let start = self.monitor().head_start.load(Ordering::Relaxed) as usize;
-        let offset = (this as usize) * OpenOptions::PAGE_SIZE;
+        let offset = (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
         unsafe {
             ptr::NonNull::new(base.add(start).add(offset) as *mut QueueHead).unwrap()
         }
     }
 
-    fn queue_start(&self, this: u32) -> ptr::NonNull<u64> {
+    fn queue_start(&self, this: ShmRingId) -> (ptr::NonNull<u64>, u32) {
         let base = self.monitor.as_ptr() as *mut u8;
 
         let start = self.monitor().queue_start.load(Ordering::Relaxed) as usize;
-        let offset = 2 * (this as usize) * OpenOptions::PAGE_SIZE;
+        let offset = 2 * (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
         unsafe {
             ptr::NonNull::new(base.add(start).add(offset) as *mut u64).unwrap()
         }
     }
 
-    fn scratch_start(&self, this: u32) -> ptr::NonNull<u8> {
+    fn scratch_start(&self, this: ShmRingId) -> (ptr::NonNull<u8>, u32) {
         let base = self.monitor.as_ptr() as *mut u8;
 
         let start = self.monitor().head_start.load(Ordering::Relaxed) as usize;
-        let offset = 2 * (this as usize) * OpenOptions::PAGE_SIZE;
+        let offset = 2 * (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
         unsafe {
             ptr::NonNull::new(base.add(start).add(offset)).unwrap()
@@ -1011,13 +1014,12 @@ impl ShmHeads {
     ///
     /// * The pair must not outlive the shared memory.
     /// * The `this` index must be smaller than the `nr_queues`.
-    unsafe fn raw_queues_controller(&self, this: u32) -> ShmQueues {
-        let (private_head, private_queues, private_mem);
+    unsafe fn raw_queues_controller(&self, this: ShmRingId) -> ShmQueues {
         // FIXME: validated pointers? We trust the server but it's a precaution against
         // alternative implementations that are wrong..
-        private_head = self.head_start(this);
-        private_queues = self.queue_start(this);
-        private_mem = self.scratch_start(this);
+        let private_head = self.head_start(this);
+        let private_queues = self.queue_start(this);
+        let private_mem = self.scratch_start(this);
 
         ShmQueues {
             private_head,
@@ -1131,8 +1133,7 @@ struct PreparedWrite<'buffer> {
 }
 
 impl ReadHalf<'_> {
-    /// Return (reader, ready) if it is at least count bytes.
-    fn acquire_ready(&self, count: u32) -> Option<(u32, u32)> {
+    fn get_read_head_and_ready_bytes(&self) -> (u32, u32) {
         // On success we must have read with Acquire to sync the buffer contents.
         let writer = self.inner.write_head.load(Ordering::Acquire);
         // But not this, this is published by us..
@@ -1140,6 +1141,13 @@ impl ReadHalf<'_> {
         let modulo = OpenOptions::PAGE_SIZE as u32;
 
         let ready = ((writer + modulo) - reader) % modulo;
+        (reader, ready)
+    }
+
+    /// Return (reader, ready) if it is at least count bytes.
+    fn acquire_ready(&self, count: u32) -> Option<(u32, u32)> {
+        let (reader, ready) = self.get_read_head_and_ready_bytes();
+
         if ready < count {
             None
         } else {
