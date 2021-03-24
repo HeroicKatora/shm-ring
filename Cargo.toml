@@ -18,3 +18,4 @@ linux-futex = "0.1.1"
 [dev-dependencies]
 assert_fs = "1"
 escargot = "0.5"
+tempfile = "3"
