@@ -92,7 +92,7 @@ pub const FORMAT_IS_UNSTABLE: u32 = 0x8000_0000;
 /// An unstable version (see `FORMAT_IS_UNSTABLE`) must match exactly because we take complete
 /// freedom in the layout of the header, it's remaining bits are randomly generated once per bump.
 //TODO: figure out if we can 'automatically' test for layout stability by doing some const-eval.
-pub const FORMAT_VERSION: u32 = 1
+pub const FORMAT_VERSION: u32 = 2
     // FIXME: comment this line when it's ready.
     | FORMAT_IS_UNSTABLE | 0xffbd_833c
     // Line exists to nicely terminate the above expression.
@@ -134,6 +134,12 @@ pub struct MonitorHead {
     pub max_members: AtomicU32,
     /// The start address of the member list. It has `max_members` entries.
     pub member_list: AtomicU64,
+    /// The number of pages per queue.
+    /// This is also the stride within the array of queues starting at `queue_start`.
+    pub pages_per_queue: AtomicU32,
+    /// The number of pages per queue.
+    /// This is also the stride within the array of scratch space starting at `scratch_start`.
+    pub pages_per_scratch: AtomicU32,
 }
 
 /// The page with which new clients communicate with the controller.
@@ -211,6 +217,8 @@ pub enum JoinMethod {
 pub struct OpenOptions {
     num_rings: u32,
     max_members: u32,
+    queue_pages: u32,
+    scratch_pages: u32,
 }
 
 /// Valid pointers to a shm-ring head.
@@ -294,6 +302,8 @@ struct ShmQueues {
     private_head: ptr::NonNull<QueueHead>,
     private_queues: ptr::NonNull<u64>,
     private_mem: ptr::NonNull<u8>,
+    pages_per_queue: u32,
+    pages_per_scratch: u32,
     is_a_side: bool,
 }
 
@@ -350,16 +360,23 @@ pub struct RecvError;
 pub struct OptionsError;
 
 impl OpenOptions {
-    const PAGE_SIZE: usize = 4096;
+    // FIXME: should use constant from libc or system headers.
+    const PAGE_SIZE: usize = (1 << 12);
     // TODO: do we want a useful magic before release?
     const MAGIC: u32 = SHM_MAGIC;
     const RINGS_MAX: u32 = 4096;
     const MEMBERS_MAX: u32 = 256;
+    /// Pages per queue in a ring.
+    const DEFAULT_QUEUE_PAGES: u32 = 1 << 4;
+    /// Number of pages of scratch space per queue.
+    const DEFAULT_SCRATCH_PAGES: u32 = 1 << 4;
 
     pub fn new() -> Self {
         OpenOptions {
             num_rings: 64,
             max_members: 32,
+            queue_pages: Self::DEFAULT_QUEUE_PAGES,
+            scratch_pages: Self::DEFAULT_SCRATCH_PAGES
         }
     }
 
@@ -447,8 +464,15 @@ impl OpenOptions {
 
     pub fn create(self, path: &std::path::Path) -> Result<ShmController, shared_memory::ShmemError> {
         assert!(self.max_members <= self.num_rings, "At least one ring per potential member is required");
-        let pages = self.num_rings as usize * 5 + 3;
+        let pages = 3 // head pages for the controller.
+            // pages for each ring control head
+            + self.num_rings as usize * 1
+            // pages for each rings' queues
+            + self.num_rings as usize * 2 * self.queue_pages as usize
+            // pages for each rings' scratch space
+            + self.num_rings as usize * 2 * self.scratch_pages as usize;
         let size = pages * Self::PAGE_SIZE;
+
         let mut shared = shared_memory::ShmemConf::new()
             .flink(path)
             // Three pages for the controller: head, open, free
@@ -485,7 +509,7 @@ impl OpenOptions {
         monitor.head_start.store(first_head * Self::PAGE_SIZE as u64, Ordering::Release);
         let first_queue = first_head + u64::from(self.num_rings);
         monitor.queue_start.store(first_queue * Self::PAGE_SIZE as u64, Ordering::Release);
-        let first_heap = first_queue + 2 * u64::from(self.num_rings);
+        let first_heap = first_queue + u64::from(self.num_rings) * 2 * u64::from(self.queue_pages);
         monitor.scratch_start.store(first_heap * Self::PAGE_SIZE as u64, Ordering::Release);
         monitor.nr_queues.store(self.num_rings, Ordering::Release);
         monitor.members.store(0, Ordering::Release);
@@ -493,6 +517,8 @@ impl OpenOptions {
         // For now, starts directly behind head.
         let member_list_start = u64::try_from(mem::size_of::<MonitorHead>()).unwrap();
         monitor.member_list.store(member_list_start, Ordering::Release);
+        monitor.pages_per_queue.store(self.queue_pages, Ordering::Release);
+        monitor.pages_per_scratch.store(self.scratch_pages, Ordering::Release);
         assert_eq!(controller.member_list().len(), self.max_members as usize);
         for member in controller.member_list() {
             member.store(0, Ordering::Release);
@@ -990,22 +1016,28 @@ impl ShmHeads {
         let base = self.monitor.as_ptr() as *mut u8;
 
         let start = self.monitor().queue_start.load(Ordering::Relaxed) as usize;
-        let offset = 2 * (this.0 as usize) * OpenOptions::PAGE_SIZE;
+        let pages = self.monitor().pages_per_queue.load(Ordering::Relaxed);
+        let offset = 2 * pages as usize * (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
-        unsafe {
+        let head = unsafe {
             ptr::NonNull::new(base.add(start).add(offset) as *mut u64).unwrap()
-        }
+        };
+
+        (head, pages)
     }
 
     fn scratch_start(&self, this: ShmRingId) -> (ptr::NonNull<u8>, u32) {
         let base = self.monitor.as_ptr() as *mut u8;
 
         let start = self.monitor().head_start.load(Ordering::Relaxed) as usize;
-        let offset = 2 * (this.0 as usize) * OpenOptions::PAGE_SIZE;
+        let pages = self.monitor().pages_per_scratch.load(Ordering::Relaxed);
+        let offset = 2 * pages as usize * (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
-        unsafe {
+        let head = unsafe {
             ptr::NonNull::new(base.add(start).add(offset)).unwrap()
-        }
+        };
+
+        (head, pages)
     }
 
     /// Create a pair of queues.
@@ -1018,13 +1050,15 @@ impl ShmHeads {
         // FIXME: validated pointers? We trust the server but it's a precaution against
         // alternative implementations that are wrong..
         let private_head = self.head_start(this);
-        let private_queues = self.queue_start(this);
-        let private_mem = self.scratch_start(this);
+        let (private_queues, pages_per_queue) = self.queue_start(this);
+        let (private_mem, pages_per_scratch) = self.scratch_start(this);
 
         ShmQueues {
             private_head,
             private_queues,
             private_mem,
+            pages_per_queue,
+            pages_per_scratch,
             is_a_side: true,
         }
     }
@@ -1067,14 +1101,15 @@ impl ShmQueues {
 
     fn half_to_read_from(&mut self) -> ReadHalf<'_> {
         let queue = self.head();
+        let memory_per_queue = self.pages_per_queue as usize * OpenOptions::PAGE_SIZE;
         let (inner, offset) = if self.is_a_side {
-            (&queue.half_b, OpenOptions::PAGE_SIZE)
+            (&queue.half_b, memory_per_queue)
         } else {
             (&queue.half_a, 0)
         };
         let buffer = unsafe {
             let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
-            let buffer = ptr::slice_from_raw_parts(addr, OpenOptions::PAGE_SIZE);
+            let buffer = ptr::slice_from_raw_parts(addr, memory_per_queue);
             &*(buffer as *const [AtomicU8])
         };
         ReadHalf {
@@ -1085,14 +1120,15 @@ impl ShmQueues {
 
     fn half_to_write_to(&mut self) -> WriteHalf<'_> {
         let queue = unsafe { &*self.private_head.as_ptr() };
+        let memory_per_queue = self.pages_per_queue as usize * OpenOptions::PAGE_SIZE;
         let (inner, offset) = if self.is_a_side {
             (&queue.half_a, 0)
         } else {
-            (&queue.half_b, OpenOptions::PAGE_SIZE)
+            (&queue.half_b, memory_per_queue)
         };
         let buffer = unsafe {
             let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
-            let buffer = ptr::slice_from_raw_parts(addr, OpenOptions::PAGE_SIZE);
+            let buffer = ptr::slice_from_raw_parts(addr, memory_per_queue);
             &*(buffer as *const [AtomicU8])
         };
         WriteHalf {
@@ -1265,6 +1301,7 @@ impl PreparedWrite<'_> {
     }
 
     fn commit(self) {
+        // eprintln!("{:p} {}", &self.commit.inner.write_head, self.write_end);
         if cfg!(debug_assertions) {
             let must_succeed = self.commit.inner.write_head.compare_exchange(
                 self.write_base, self.write_end, Ordering::Release, Ordering::Relaxed);
