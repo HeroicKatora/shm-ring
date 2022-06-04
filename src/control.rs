@@ -1,4 +1,14 @@
-use super::{ActiveQueue, Events, OpenClient, OpenServer, ReadHalf, ShmController, ShmQueue};
+use super::{
+    ActiveQueue,
+    Events,
+    OpenClient,
+    OpenServer,
+    ReadHalf,
+    ShmController,
+    ShmControllerRing,
+    ShmQueue,
+};
+use std::collections::HashMap;
 
 /// A tag is an identifier for a pending request.
 ///
@@ -49,10 +59,10 @@ pub struct ControlResponse<'ring> {
     ring: &'ring ReadHalf<'ring>,
 }
 
-/// Request a new ring as a server (queue head A).
+/// Request a new pipe as a 'server' (queue head A).
 ///
 /// The `public_id` is used as the first argument.
-pub struct RequestNewRing {
+pub struct PipeRequest {
     /// An identifier with which other clients can request this ring.
     /// The method of discovering which id to use is out-of-scope for the shm-controller itself. A
     /// useful mechanism for statically determined networks may be unique IDs.
@@ -61,8 +71,8 @@ pub struct RequestNewRing {
     pub tag: Tag,
 }
 
-/// Join a ring with a public id as a client (queue head B).
-pub struct ServerJoin {
+/// Join a pipe with a public id as a client (queue head B).
+pub struct PipeJoin {
     /// The identifier that was used when creating the server.
     /// When this matches multiple servers then any of these is chosen (Internally, the first.. But
     /// this detail is not yet stable. Don't rely on the order yet).
@@ -71,8 +81,8 @@ pub struct ServerJoin {
     pub tag: Tag,
 }
 
-/// Purposefully leave a ring.
-pub struct LeaveRing {
+/// Purposefully leave a pipe.
+pub struct PipeLeave {
     /// The queue ID that you want to leave.
     pub queue: u32,
     /// The tag identifying the request.
@@ -84,22 +94,42 @@ pub struct Ping {
     pub payload: Tag,
 }
 
+pub trait Request {
+    type Response;
+    /// Set the tag that the poll structure has chosen.
+    fn set_tag(&mut self, _: Tag);
+    /// Get the tag of the request.
+    fn tag(&self) -> Tag;
+    /// Interpret the returned message as a response.
+    fn response(&self, _: ControlResponse<'_>) -> Self::Response;
+}
+
+/// A structure with which to poll a control queue.
+///
+/// The message structure works the same in both directions.
+pub struct Poll {
+    /// The ring we encapsulate.
+    ring: ShmControllerRing,
+    /// A buffer of recent responses.
+    responses: HashMap<Tag, ControlMessage>,
+}
+
 impl Cmd {
     pub const BAD: Self = Cmd(!0);
     pub const UNIMPLEMENTED: Self = Cmd(!0 - 1);
     pub const OUT_OF_QUEUES: Self = Cmd(!0 - 2);
 
     /// Create a new ring as a server.
-    pub const REQUEST_NEW_RING: Self = Cmd(1);
+    pub const REQUEST_PIPE: Self = Cmd(1);
     /// A ping will immediately be answered by a ping back.
     pub const REQUEST_PING: Self = Cmd(2);
     /// A client connection to an existing server.
-    pub const SERVER_JOIN: Self = Cmd(3);
+    pub const PIPE_JOIN: Self = Cmd(3);
     /// Advertise a server host, but do not yet create a queue.
     /// More or less a listening socket.
     pub const SERVER_HOST: Self = Cmd(4);
     /// Remove ourselves from a channel, giving the spot up.
-    pub const LEAVE: Self = Cmd(5);
+    pub const PIPE_LEAVE: Self = Cmd(5);
 }
 
 impl ControlMessage {
@@ -139,9 +169,9 @@ impl ControlMessage {
     }
 }
 
-impl From<RequestNewRing> for ControlMessage {
-    fn from(RequestNewRing { tag, public_id }: RequestNewRing) -> Self {
-        ControlMessage::with_raw(Cmd::REQUEST_NEW_RING, tag).with_argument(public_id)
+impl From<PipeRequest> for ControlMessage {
+    fn from(PipeRequest { tag, public_id }: PipeRequest) -> Self {
+        ControlMessage::with_raw(Cmd::REQUEST_PIPE, tag).with_argument(public_id)
     }
 }
 
@@ -151,15 +181,15 @@ impl From<Ping> for ControlMessage {
     }
 }
 
-impl From<ServerJoin> for ControlMessage {
-    fn from(ServerJoin { tag, public_id }: ServerJoin) -> Self {
-        ControlMessage::with_raw(Cmd::SERVER_JOIN, tag).with_argument(public_id)
+impl From<PipeJoin> for ControlMessage {
+    fn from(PipeJoin { tag, public_id }: PipeJoin) -> Self {
+        ControlMessage::with_raw(Cmd::PIPE_JOIN, tag).with_argument(public_id)
     }
 }
 
-impl From<LeaveRing> for ControlMessage {
-    fn from(LeaveRing { tag, queue }: LeaveRing) -> Self {
-        ControlMessage::with_raw(Cmd::LEAVE, tag).with_argument(queue)
+impl From<PipeLeave> for ControlMessage {
+    fn from(PipeLeave { tag, queue }: PipeLeave) -> Self {
+        ControlMessage::with_raw(Cmd::PIPE_LEAVE, tag).with_argument(queue)
     }
 }
 
@@ -191,7 +221,7 @@ impl ControlMessage {
                     extra_space = 0;
                     op = Cmd::REQUEST_PING;
                 }
-                Cmd::REQUEST_NEW_RING => {
+                Cmd::REQUEST_PIPE => {
                     extra_space = 0;
 
                     let queue = controller.state.free_queues.pop();
@@ -202,13 +232,13 @@ impl ControlMessage {
                             user_tag: msg.value0(),
                             a: queue_owner,
                         });
-                        op = Cmd::REQUEST_NEW_RING;
+                        op = Cmd::REQUEST_PIPE;
                         result = queue;
                     } else {
                         op = Cmd::OUT_OF_QUEUES;
                     }
                 }
-                Cmd::SERVER_JOIN => {
+                Cmd::PIPE_JOIN => {
                     extra_space = 0;
 
                     let matching = controller.state.open_server.iter().position(|open| {
@@ -224,13 +254,13 @@ impl ControlMessage {
                             b: queue_owner,
                         });
 
-                        op = Cmd::REQUEST_NEW_RING;
+                        op = Cmd::REQUEST_PIPE;
                         result = open.queue;
                     } else {
                         op = Cmd::OUT_OF_QUEUES;
                     }
                 }
-                Cmd::LEAVE => {
+                Cmd::PIPE_LEAVE => {
                     extra_space = 0;
 
                     let matching = controller.state.active.iter().position(|active| {
@@ -246,7 +276,7 @@ impl ControlMessage {
                                 b: active.b,
                             });
 
-                            op = Cmd::LEAVE;
+                            op = Cmd::PIPE_LEAVE;
                         } else if controller.state.active[matching].b == queue_owner {
                             let active = controller.state.active.remove(matching);
                             controller.state.open_server.push(OpenServer {
@@ -255,7 +285,7 @@ impl ControlMessage {
                                 a: active.a,
                             });
 
-                            op = Cmd::LEAVE;
+                            op = Cmd::PIPE_LEAVE;
                         } else {
                             // This message from the wrong person. Just don't do anything, but
                             // answer something to make them aware.
@@ -268,7 +298,7 @@ impl ControlMessage {
                 _ => {
                     extra_space = 0;
                     op = match cmd {
-                        Cmd::SERVER_HOST | Cmd::LEAVE => Cmd::UNIMPLEMENTED,
+                        Cmd::SERVER_HOST => Cmd::UNIMPLEMENTED,
                         _ => Cmd::BAD,
                     };
                 }
@@ -290,6 +320,26 @@ impl ControlMessage {
                 events.request(msg, answer);
             }
         }
+    }
+}
+
+impl Poll {
+    /// Wrap a ring for communication via control messages.
+    pub fn new(ring: ShmControllerRing) -> Self {
+        Poll {  ring, responses: HashMap::default() }
+    }
+
+    /// Unwrap the raw ring within.
+    pub fn into_ring(self) -> ShmControllerRing {
+        self.ring
+    }
+
+    pub fn send(&mut self, _: &mut impl Request) {
+        todo!()
+    }
+
+    pub fn retrieve<R: Request>(&mut self, _: &R) -> Option<R::Response> {
+        todo!()
     }
 }
 

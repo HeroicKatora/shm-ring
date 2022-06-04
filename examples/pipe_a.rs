@@ -1,10 +1,9 @@
 /// An echo server attaching itself to a controller.
-use std::path::Path;
 use shm_ring::{self, control::Cmd, ShmRingId};
 
 fn main() {
     let client = shm_ring::OpenOptions::new()
-        .open(Path::new("server"))
+        .open("shm-ring-example-server")
         .unwrap();
 
     println!("[.] Allowed methods: {}", client.raw_join_methods());
@@ -16,7 +15,7 @@ fn main() {
         .unwrap();
     println!("[+] Joined");
 
-    server.request(shm_ring::control::RequestNewRing {
+    server.request(shm_ring::control::PipeRequest {
         tag: Default::default(),
         public_id: 0xD,
     }).unwrap();
@@ -52,7 +51,7 @@ fn main() {
         std::process::exit(1);
     }
     
-    assert_eq!(kind, Cmd::REQUEST_NEW_RING);
+    assert_eq!(kind, Cmd::REQUEST_PIPE);
     println!("[+] Granted {}", listen);
     let mut queue = server
         .trust_me_with_all_queues()

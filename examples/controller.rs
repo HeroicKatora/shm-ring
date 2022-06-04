@@ -1,10 +1,9 @@
 /// An controller hosting an shm_ring.
-use std::path::Path;
 use shm_ring;
 
 fn main() {
     let mut controller = shm_ring::OpenOptions::new()
-        .create(Path::new("server"))
+        .create("shm-ring-example-server")
         .unwrap();
 
     println!("Allowed methods: {}", controller.raw_join_methods());

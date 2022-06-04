@@ -78,6 +78,7 @@ mod os_impl;
 #[cfg(target_os = "windows")]
 #[path = "windows.rs"]
 mod os_impl;
+pub mod process;
 
 use core::{cell, marker, mem, ptr, slice};
 use core::convert::TryFrom;
@@ -228,11 +229,20 @@ struct ShmHeads {
     open: ptr::NonNull<MonitorOpen>,
 }
 
+// these are part of the allocation for the process.
+unsafe impl Send for ShmHeads {}
+
 pub struct ShmController {
     shared: Shmem,
     heads: ShmHeads,
     state: Box<ControllerState>,
 }
+
+// FIXME: these should be derived, but shared_memory::MapData->shared_memory::Shmem fails to
+// provide it and contains a single raw pointer.
+unsafe impl Send for ShmController {}
+unsafe impl Send for ShmClient {}
+unsafe impl Send for ShmRing {}
 
 struct ControllerState {
     free_queues: Vec<u32>,
@@ -414,10 +424,11 @@ impl OpenOptions {
         Ok(self)
     }
 
-    pub fn open(self, path: &std::path::Path) -> Result<ShmClient, shared_memory::ShmemError> {
+    pub fn open(self, path: &str) -> Result<ShmClient, shared_memory::ShmemError> {
         let shared = shared_memory::ShmemConf::new()
-            .flink(path)
+            .os_id(path)
             .open()?;
+
         // Okay, can we begin inspecting the pages?
         if shared.len() < mem::size_of::<MonitorHead>() {
             return Err(shared_memory::ShmemError::MapSizeZero);
@@ -462,7 +473,7 @@ impl OpenOptions {
         })
     }
 
-    pub fn create(self, path: &std::path::Path) -> Result<ShmController, shared_memory::ShmemError> {
+    pub fn create(self, path: &str) -> Result<ShmController, shared_memory::ShmemError> {
         assert!(self.max_members <= self.num_rings, "At least one ring per potential member is required");
         let pages = 3 // head pages for the controller.
             // pages for each ring control head
@@ -474,7 +485,7 @@ impl OpenOptions {
         let size = pages * Self::PAGE_SIZE;
 
         let mut shared = shared_memory::ShmemConf::new()
-            .flink(path)
+            .os_id(path)
             // Three pages for the controller: head, open, free
             // Five pages per ring (one head, 2 for commands, 2 buffers)
             .size(size)
@@ -536,10 +547,6 @@ impl OpenOptions {
 }
 
 impl ShmController {
-    pub fn path(&self) -> &std::path::Path {
-        self.shared.get_flink_path().unwrap()
-    }
-
     pub fn raw_join_methods(&self) -> u32 {
         self.monitor().open_with.load(Ordering::Relaxed)
     }

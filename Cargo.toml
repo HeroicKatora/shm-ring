@@ -10,7 +10,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 libc = "0.2.76"
-shared_memory = "0.11"
+shared_memory = "0.12"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-futex = "0.1.1"

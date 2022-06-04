@@ -1,10 +1,9 @@
 /// An echo server attaching itself to a controller.
-use std::path::Path;
 use shm_ring::{self, control::Cmd, ShmRingId};
 
 fn main() {
     let client = shm_ring::OpenOptions::new()
-        .open(Path::new("server"))
+        .open("shm-ring-example-server")
         .unwrap();
 
     println!("[.] Allowed methods: {}", client.raw_join_methods());
@@ -18,7 +17,7 @@ fn main() {
 
     // First check that the wrong ID does not give us a server but returns.
     {
-        client.request(shm_ring::control::ServerJoin {
+        client.request(shm_ring::control::PipeJoin {
             tag: Default::default(),
             public_id: 0xBAD,
         }).unwrap();
@@ -40,7 +39,7 @@ fn main() {
         };
     }
 
-    client.request(shm_ring::control::ServerJoin {
+    client.request(shm_ring::control::PipeJoin {
         tag: Default::default(),
         public_id: 0xD,
     }).unwrap();
@@ -97,7 +96,7 @@ fn main() {
     let queue = queue.queue_id();
 
     // Leave the server queue, gives it up to another client.
-    while let Err(_) = client.request(shm_ring::control::LeaveRing {
+    while let Err(_) = client.request(shm_ring::control::PipeLeave {
         tag: Default::default(),
         queue: queue.0,
     }) { };
