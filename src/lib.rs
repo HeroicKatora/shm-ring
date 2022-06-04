@@ -71,6 +71,7 @@
 //! resume and unwillingly interfere with another thread that took its place. The second case can
 //! be resolved more forcefully but may be different (harder?) to detect.
 mod atomic;
+mod controller;
 pub mod control;
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
@@ -244,34 +245,7 @@ unsafe impl Send for ShmController {}
 unsafe impl Send for ShmClient {}
 unsafe impl Send for ShmRing {}
 
-struct ControllerState {
-    free_queues: Vec<u32>,
-    open_server: Vec<OpenServer>,
-    open_client: Vec<OpenClient>,
-    active: Vec<ActiveQueue>,
-}
-
-/// A queue opened only on the server (A) side.
-struct OpenServer {
-    queue: u32,
-    user_tag: u32,
-    a: u32,
-}
-
-/// A queue opened only on the client (A) side, i.e. pending request.
-struct OpenClient {
-    queue: u32,
-    user_tag: u32,
-    b: u32,
-}
-
-/// A queue with both sides alive.
-struct ActiveQueue {
-    queue: u32,
-    user_tag: u32,
-    a: u32,
-    b: u32,
-}
+pub use crate::controller::ControllerState;
 
 pub struct Events {
     joined: Vec<(u64, u32)>,
@@ -611,6 +585,8 @@ impl ControllerState {
             open_server: vec![],
             active: vec![],
             open_client: vec![],
+            sockets: vec![],
+            binds: vec![].into_iter().collect(),
         })
     }
 }

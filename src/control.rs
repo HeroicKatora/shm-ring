@@ -1,13 +1,11 @@
 use super::{
-    ActiveQueue,
     Events,
-    OpenClient,
-    OpenServer,
     ReadHalf,
     ShmController,
     ShmControllerRing,
     ShmQueue,
 };
+
 use std::collections::HashMap;
 
 /// A tag is an identifier for a pending request.
@@ -54,6 +52,9 @@ pub struct ControlMessage {
     pub op: u64,
 }
 
+/// A message passed on a socket-control queue.
+pub struct SocketMessage(ControlMessage);
+
 pub struct ControlResponse<'ring> {
     pub msg: ControlMessage,
     ring: &'ring ReadHalf<'ring>,
@@ -94,6 +95,48 @@ pub struct Ping {
     pub payload: Tag,
 }
 
+
+/// Request a new server.
+///
+/// Send this on the controller queue.
+///
+/// Establishes a separate queue with the controller, in which notifications about accepted
+/// connections arrive and with which modifications to the socket can be performed.
+pub struct SocketCreate {
+    /// reserved, ID of a configured descriptor. Must be `0`.
+    pub public_id: u32,
+    /// The tag identifying the request.
+    pub tag: Tag,
+}
+
+/// Open a socket on a port.
+///
+/// Send this on a socket queue.
+pub struct SocketBind {
+    /// The port under which to bind the socket.
+    pub port: u32,
+    /// The tag identifying the request.
+    pub tag: Tag,
+}
+
+/// Designate an area for accepted connections.
+pub struct SocketAccept {
+    /// The page where to put accepted sockets.
+    pub location: u32,
+    /// The tag identifying the request.
+    pub tag: Tag,
+}
+
+/// Connect to a socket under a port.
+///
+/// Send this on the controller queue.
+pub struct SocketConnect {
+    /// The port under which the target socket is bound.
+    pub port: u32,
+    /// The tag identifying the request.
+    pub tag: Tag,
+}
+
 pub trait Request {
     type Response;
     /// Set the tag that the poll structure has chosen.
@@ -121,13 +164,20 @@ impl Cmd {
 
     /// Create a new ring as a server.
     pub const REQUEST_PIPE: Self = Cmd(1);
-    /// A ping will immediately be answered by a ping back.
-    pub const REQUEST_PING: Self = Cmd(2);
     /// A client connection to an existing server.
     pub const PIPE_JOIN: Self = Cmd(3);
-    /// Advertise a server host, but do not yet create a queue.
-    /// More or less a listening socket.
-    pub const SERVER_HOST: Self = Cmd(4);
+
+    /// A ping will immediately be answered by a ping back.
+    pub const REQUEST_PING: Self = Cmd(2);
+
+    /// Create a queue for a server host, but do not advertise it yet.
+    /// More or less a socket.
+    pub const SOCKET_CREATE: Self = Cmd(4);
+    /// Advertise a socket on a particular 'port'.
+    pub const SOCKET_BIND: Self = Cmd(5);
+    /// Advertise a socket on a particular 'port'.
+    pub const SOCKET_CONNECT: Self = Cmd(6);
+
     /// Remove ourselves from a channel, giving the spot up.
     pub const PIPE_LEAVE: Self = Cmd(5);
 }
@@ -146,25 +196,25 @@ impl ControlMessage {
         self.with_result(val)
     }
 
-    fn with_raw(Cmd(op): Cmd, Tag(tag): Tag) -> Self {
+    pub(crate) fn with_raw(Cmd(op): Cmd, Tag(tag): Tag) -> Self {
         ControlMessage {
             op: u64::from(op) << 16 | u64::from(tag)
         }
     }
 
-    fn with_result(self, val: u32) -> Self {
+    pub(crate) fn with_result(self, val: u32) -> Self {
         ControlMessage { op: self.op | u64::from(val) << 32 }
     }
 
-    fn tag(self) -> Tag {
+    pub(crate) fn tag(self) -> Tag {
         Tag(self.op as u16)
     }
 
-    fn cmd(self) -> Cmd {
+    pub(crate) fn cmd(self) -> Cmd {
         Cmd((self.op >> 16) as u16)
     }
 
-    fn value0(self) -> u32 {
+    pub(crate) fn value0(self) -> u32 {
         (self.op >> 32) as u32
     }
 }
@@ -193,133 +243,34 @@ impl From<PipeLeave> for ControlMessage {
     }
 }
 
+impl From<SocketCreate> for ControlMessage {
+    fn from(SocketCreate { public_id, tag }: SocketCreate) -> Self {
+        ControlMessage::with_raw(Cmd::SOCKET_CREATE, tag).with_argument(public_id)
+    }
+}
+
+impl From<SocketBind> for SocketMessage {
+    fn from(SocketBind { port, tag }: SocketBind) -> Self {
+        let ctrl = ControlMessage::with_raw(Cmd::SOCKET_BIND, tag).with_argument(port);
+        SocketMessage(ctrl)
+    }
+}
+
+impl From<SocketConnect> for ControlMessage {
+    fn from(SocketConnect { port, tag }: SocketConnect) -> Self {
+        ControlMessage::with_raw(Cmd::SOCKET_CONNECT, tag).with_argument(port)
+    }
+}
+
 /// Private implementation of commands.
 impl ControlMessage {
     pub(crate) fn execute(
         controller: &mut ShmController,
         queue_owner: u32,
-        mut queue: ShmQueue<'_>,
-        mut events: Option<&mut Events>,
+        queue: ShmQueue<'_>,
+        events: Option<&mut Events>,
     ) {
-        let queues = &mut queue.queues;
-        if queues.half_to_write_to().prepare_write(8).is_none() {
-            // No space for response. Don't.
-            return;
-        }
-
-        let mut reader = queues.half_to_read_from();
-        if let Some(available) = reader.available(8) {
-            let op = available.controller_u64();
-            let msg = ControlMessage { op };
-            let tag = msg.tag();
-            let cmd = msg.cmd();
-
-            let mut result = 0;
-            let (mut op, extra_space);
-            match cmd {
-                Cmd::REQUEST_PING => {
-                    extra_space = 0;
-                    op = Cmd::REQUEST_PING;
-                }
-                Cmd::REQUEST_PIPE => {
-                    extra_space = 0;
-
-                    let queue = controller.state.free_queues.pop();
-
-                    if let Some(queue) = queue {
-                        controller.state.open_server.push(OpenServer {
-                            queue,
-                            user_tag: msg.value0(),
-                            a: queue_owner,
-                        });
-                        op = Cmd::REQUEST_PIPE;
-                        result = queue;
-                    } else {
-                        op = Cmd::OUT_OF_QUEUES;
-                    }
-                }
-                Cmd::PIPE_JOIN => {
-                    extra_space = 0;
-
-                    let matching = controller.state.open_server.iter().position(|open| {
-                        open.user_tag == msg.value0()
-                    });
-
-                    if let Some(matching) = matching {
-                        let open = controller.state.open_server.remove(matching);
-                        controller.state.active.push(ActiveQueue {
-                            queue: open.queue,
-                            user_tag: open.user_tag,
-                            a: open.a,
-                            b: queue_owner,
-                        });
-
-                        op = Cmd::REQUEST_PIPE;
-                        result = open.queue;
-                    } else {
-                        op = Cmd::OUT_OF_QUEUES;
-                    }
-                }
-                Cmd::PIPE_LEAVE => {
-                    extra_space = 0;
-
-                    let matching = controller.state.active.iter().position(|active| {
-                        active.queue == msg.value0()
-                    });
-
-                    if let Some(matching) = matching {
-                        if controller.state.active[matching].a == queue_owner {
-                            let active = controller.state.active.remove(matching);
-                            controller.state.open_client.push(OpenClient {
-                                queue: active.queue,
-                                user_tag: active.user_tag,
-                                b: active.b,
-                            });
-
-                            op = Cmd::PIPE_LEAVE;
-                        } else if controller.state.active[matching].b == queue_owner {
-                            let active = controller.state.active.remove(matching);
-                            controller.state.open_server.push(OpenServer {
-                                queue: active.queue,
-                                user_tag: active.user_tag,
-                                a: active.a,
-                            });
-
-                            op = Cmd::PIPE_LEAVE;
-                        } else {
-                            // This message from the wrong person. Just don't do anything, but
-                            // answer something to make them aware.
-                            op = Cmd::OUT_OF_QUEUES;
-                        }
-                    } else {
-                        op = Cmd::OUT_OF_QUEUES;
-                    }
-                }
-                _ => {
-                    extra_space = 0;
-                    op = match cmd {
-                        Cmd::SERVER_HOST => Cmd::UNIMPLEMENTED,
-                        _ => Cmd::BAD,
-                    };
-                }
-            };
-            if extra_space > 0 {
-                op = Cmd::UNIMPLEMENTED;
-            }
-            // At this point, commit to writing a result.
-            available.commit();
-
-            let answer = ControlMessage::with_raw(op, tag).with_result(result);
-            let mut writer = queues.half_to_write_to();
-            let mut write = writer.prepare_write(8).unwrap();
-            write.controller_u64(answer.op);
-            write.commit();
-
-            if let Some(ref mut events) = &mut events {
-                // TODO: provide info on who or what queue?
-                events.request(msg, answer);
-            }
-        }
+        controller.state.execute_control(queue_owner, queue, events)
     }
 }
 
@@ -346,7 +297,7 @@ impl Poll {
 impl<'ring> ControlResponse<'ring> {
     pub fn new(ring: &'ring ReadHalf, op: [u8; 8]) -> Self {
         ControlResponse {
-            ring: ring,
+            ring,
             msg: ControlMessage {
                 op: u64::from_be_bytes(op),
             },
