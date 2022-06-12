@@ -18,7 +18,7 @@
 //! - @`head.open`, one Page: A [`MonitorOpen`], called `open`.
 //! - @`head.head_start`, N Pages: Each page is a [`QueueHead`], starting with the pages for the
 //!   `head.max_members` member slots. There is exactly one page per Queue. Queues are identified
-//!   by their page offset, i.e. the queue at `head.head_start` is queue 0 and the one at 
+//!   by their page offset, i.e. the queue at `head.head_start` is queue 0 and the one at
 //!   `head.head_start + PAGE_SIZE` is queue 1.
 //! - @`head.queue_start`, 2*N Pages: Each two pages are one queue with space for the A and B side.
 //! - @`head.scratch_start`, 2*N Pages: Each two pages are one scratch space for the A and B side.
@@ -71,8 +71,8 @@
 //! resume and unwillingly interfere with another thread that took its place. The second case can
 //! be resolved more forcefully but may be different (harder?) to detect.
 mod atomic;
-mod controller;
 pub mod control;
+mod controller;
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
 mod os_impl;
@@ -81,12 +81,12 @@ mod os_impl;
 mod os_impl;
 pub mod process;
 
-use core::{cell, marker, mem, ptr, slice};
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicU8, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::{cell, marker, mem, ptr, slice};
 
-use shared_memory::Shmem;
 use atomic::{AtomicMem, Slice};
+use shared_memory::Shmem;
 
 /// A bit mask marking unstable versions.
 pub const FORMAT_IS_UNSTABLE: u32 = 0x8000_0000;
@@ -157,8 +157,10 @@ pub struct MonitorOpen {
     pub futex: AtomicI32,
     /// Filler. Unused. Don't use. Might get used.
     /// NOTE: This field is only pub for rustdoc.
-    #[cfg(not(rustdoc))] pub _reserved: u32,
-    #[cfg(rustdoc)] _reserved: u32,
+    #[cfg(not(rustdoc))]
+    pub _reserved: u32,
+    #[cfg(rustdoc)]
+    _reserved: u32,
     /// The start address of the pipe's name if any.
     pub pipe_name: AtomicU64,
 }
@@ -190,8 +192,10 @@ pub struct QueueHalf {
     pub futex_a: AtomicI32,
     /// Filler. Unused. Don't use. Might get used.
     /// NOTE: This field is only pub for rustdoc.
-    #[cfg(not(rustdoc))] pub _reserved: u32,
-    #[cfg(rustdoc)] _reserved: u32,
+    #[cfg(not(rustdoc))]
+    pub _reserved: u32,
+    #[cfg(rustdoc)]
+    _reserved: u32,
     /// The write head.
     pub write_head: AtomicU32,
     /// The read head.
@@ -300,10 +304,15 @@ pub struct ShmRing {
 }
 
 pub struct ShmQueue<'shared_is_alive> {
-    _lt: marker::PhantomData<& 'shared_is_alive ShmRing>,
+    _lt: marker::PhantomData<&'shared_is_alive ShmRing>,
     heads: ShmHeads,
     queues: ShmQueues,
     id: ShmRingId,
+}
+
+/// A queue controlling a socket.
+pub struct SocketQueue<'shared_is_alive> {
+    queue: ShmQueue<'shared_is_alive>,
 }
 
 /// An active connection to the controller.
@@ -360,7 +369,7 @@ impl OpenOptions {
             num_rings: 64,
             max_members: 32,
             queue_pages: Self::DEFAULT_QUEUE_PAGES,
-            scratch_pages: Self::DEFAULT_SCRATCH_PAGES
+            scratch_pages: Self::DEFAULT_SCRATCH_PAGES,
         }
     }
 
@@ -399,9 +408,7 @@ impl OpenOptions {
     }
 
     pub fn open(self, path: &str) -> Result<ShmClient, shared_memory::ShmemError> {
-        let shared = shared_memory::ShmemConf::new()
-            .os_id(path)
-            .open()?;
+        let shared = shared_memory::ShmemConf::new().os_id(path).open()?;
 
         // Okay, can we begin inspecting the pages?
         if shared.len() < mem::size_of::<MonitorHead>() {
@@ -430,7 +437,7 @@ impl OpenOptions {
         }
 
         // Okay, now the current format specific checks.
-        if shared.len() < 2*mem::size_of::<MonitorHead>() {
+        if shared.len() < 2 * mem::size_of::<MonitorHead>() {
             return Err(shared_memory::ShmemError::MapSizeZero);
         }
 
@@ -438,7 +445,8 @@ impl OpenOptions {
             // SAFETY: we've somewhat validated this is the right shared memory. At least it's
             // large enough.
             ShmHeads::from_monitor(head.cast(), shared.len())
-        }.map_err(|_| shared_memory::ShmemError::MapSizeZero)?;
+        }
+        .map_err(|_| shared_memory::ShmemError::MapSizeZero)?;
 
         Ok(ShmClient {
             shared,
@@ -448,7 +456,10 @@ impl OpenOptions {
     }
 
     pub fn create(self, path: &str) -> Result<ShmController, shared_memory::ShmemError> {
-        assert!(self.max_members <= self.num_rings, "At least one ring per potential member is required");
+        assert!(
+            self.max_members <= self.num_rings,
+            "At least one ring per potential member is required"
+        );
         let pages = 3 // head pages for the controller.
             // pages for each ring control head
             + self.num_rings as usize * 1
@@ -489,21 +500,37 @@ impl OpenOptions {
         let monitor = controller.monitor();
         monitor.magic.store(OpenOptions::MAGIC, Ordering::Release);
         monitor.version.store(FORMAT_VERSION, Ordering::Release);
-        monitor.open_page.store(Self::PAGE_SIZE as u64, Ordering::Release);
+        monitor
+            .open_page
+            .store(Self::PAGE_SIZE as u64, Ordering::Release);
         let first_head = 3;
-        monitor.head_start.store(first_head * Self::PAGE_SIZE as u64, Ordering::Release);
+        monitor
+            .head_start
+            .store(first_head * Self::PAGE_SIZE as u64, Ordering::Release);
         let first_queue = first_head + u64::from(self.num_rings);
-        monitor.queue_start.store(first_queue * Self::PAGE_SIZE as u64, Ordering::Release);
+        monitor
+            .queue_start
+            .store(first_queue * Self::PAGE_SIZE as u64, Ordering::Release);
         let first_heap = first_queue + u64::from(self.num_rings) * 2 * u64::from(self.queue_pages);
-        monitor.scratch_start.store(first_heap * Self::PAGE_SIZE as u64, Ordering::Release);
+        monitor
+            .scratch_start
+            .store(first_heap * Self::PAGE_SIZE as u64, Ordering::Release);
         monitor.nr_queues.store(self.num_rings, Ordering::Release);
         monitor.members.store(0, Ordering::Release);
-        monitor.max_members.store(self.max_members, Ordering::Release);
+        monitor
+            .max_members
+            .store(self.max_members, Ordering::Release);
         // For now, starts directly behind head.
         let member_list_start = u64::try_from(mem::size_of::<MonitorHead>()).unwrap();
-        monitor.member_list.store(member_list_start, Ordering::Release);
-        monitor.pages_per_queue.store(self.queue_pages, Ordering::Release);
-        monitor.pages_per_scratch.store(self.scratch_pages, Ordering::Release);
+        monitor
+            .member_list
+            .store(member_list_start, Ordering::Release);
+        monitor
+            .pages_per_queue
+            .store(self.queue_pages, Ordering::Release);
+        monitor
+            .pages_per_scratch
+            .store(self.scratch_pages, Ordering::Release);
         assert_eq!(controller.member_list().len(), self.max_members as usize);
         for member in controller.member_list() {
             member.store(0, Ordering::Release);
@@ -514,7 +541,9 @@ impl OpenOptions {
         open.pipe_name.store(0, Ordering::Release);
 
         // Finally, store the join methods.
-        monitor.open_with.store(os_impl::join_methods(), Ordering::Release);
+        monitor
+            .open_with
+            .store(os_impl::join_methods(), Ordering::Release);
 
         Ok(controller)
     }
@@ -550,7 +579,10 @@ impl ShmController {
                 events.who_joined_on(who, request);
             }
 
-            self.heads.queues_controller(ShmRingId(request)).queues.reset();
+            self.heads
+                .queues_controller(ShmRingId(request))
+                .queues
+                .reset();
             self.monitor().members.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -559,9 +591,20 @@ impl ShmController {
         let clients = self.monitor().max_members.load(Ordering::Relaxed);
         for i in 0..clients {
             let heads = self.heads;
+            let client_id = controller::ClientId(i);
             let queue = heads.queues_controller(ShmRingId(i));
             let events = events.as_mut().map(|e| &mut **e);
-            control::ControlMessage::execute(self, i, queue, events);
+            self.state.execute_control(client_id, queue, events)
+        }
+
+        let sockets = self.state.sockets.len();
+        for i in 0..sockets {
+            let ring_id = self.state.sockets[i].queue;
+            let socket_id = controller::SocketId(i as u32);
+            let heads = self.heads;
+            let queue = heads.queues_controller(ShmRingId(ring_id.0));
+            let events = events.as_mut().map(|e| &mut **e);
+            self.state.execute_socket(socket_id, queue, events)
         }
     }
 
@@ -581,12 +624,13 @@ impl ShmController {
 impl ControllerState {
     fn new(config: &OpenOptions, _: &ShmHeads) -> Box<Self> {
         Box::new(ControllerState {
-            free_queues: (config.max_members..config.num_rings).collect(),
+            free_queues: (config.max_members..config.num_rings)
+                .map(controller::QueueId)
+                .collect(),
             open_server: vec![],
             active: vec![],
             open_client: vec![],
             sockets: vec![],
-            binds: vec![].into_iter().collect(),
         })
     }
 }
@@ -606,7 +650,7 @@ impl Events {
         }
 
         if let Some((message, answer)) = self.messages.pop() {
-            return Some(Event::Message { message, answer })
+            return Some(Event::Message { message, answer });
         }
 
         None
@@ -649,7 +693,7 @@ impl ShmClient {
             JoinMethod::Pipe | JoinMethod::Semaphore => {
                 self.nicely_rescind_client(want, pid);
                 return Err(ConnectError);
-            },
+            }
             JoinMethod::Futex => os_impl::futex(&self, want),
         };
 
@@ -676,10 +720,7 @@ impl ShmClient {
             .flink(self.shared.get_flink_path().unwrap())
             .open()?;
         assert_eq!(self.shared.as_ptr(), shared.as_ptr());
-        Ok(ShmClient {
-            shared,
-            ..*self
-        })
+        Ok(ShmClient { shared, ..*self })
     }
 
     fn find_open_client(&self, pid: u64) -> Result<u32, ConnectError> {
@@ -689,7 +730,7 @@ impl ShmClient {
             for (idx, c) in clients.iter().enumerate() {
                 match c.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed) {
                     Ok(_) => return Ok(idx as u32),
-                    Err(_) => {},
+                    Err(_) => {}
                 }
             }
 
@@ -701,7 +742,8 @@ impl ShmClient {
         let clients = self.member_list();
         // We should be the only updating this right now. So ignore errors..
         // This would indicate someone else already has grabbed control. Sure.
-        let _ = clients[this as usize].compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
+        let _ =
+            clients[this as usize].compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     pub(crate) fn monitor(&self) -> &MonitorHead {
@@ -815,6 +857,25 @@ impl ShmQueue<'_> {
     }
 }
 
+impl SocketQueue<'_> {
+    pub fn request(&mut self, msg: impl Into<control::SocketMessage>) -> Result<(), SendError> {
+        let msg = msg.into().op.to_be_bytes();
+        self.queue.send(&msg)
+    }
+
+    pub fn response<T>(
+        &mut self,
+        handler: impl FnOnce(control::ControlResponse) -> T,
+    ) -> Result<T, RecvError> {
+        let mut op = [0; 8];
+        self.queue.recv_with(&mut op, |filled, ring| {
+            let op = <&mut [u8; 8]>::try_from(filled).unwrap();
+            let resp = control::ControlResponse::new(ring, *op);
+            handler(resp)
+        })
+    }
+}
+
 impl ShmControllerRing {
     /// The id of this client (and its ring).
     pub fn client_id(&self) -> ShmRingId {
@@ -833,7 +894,6 @@ impl ShmControllerRing {
         TrustedQueues { inner: &self }
     }
 
-
     /// Send a request to the controller.
     pub fn request(&mut self, msg: impl Into<control::ControlMessage>) -> Result<(), SendError> {
         let msg = msg.into().op.to_be_bytes();
@@ -841,7 +901,10 @@ impl ShmControllerRing {
     }
 
     /// Receive one response if there is one available.
-    pub fn response<T>(&mut self, handler: impl FnOnce(control::ControlResponse) -> T) -> Result<T, RecvError> {
+    pub fn response<T>(
+        &mut self,
+        handler: impl FnOnce(control::ControlResponse) -> T,
+    ) -> Result<T, RecvError> {
         let mut op = [0; 8];
         self.ring.queue().recv_with(&mut op, |filled, ring| {
             let op = <&mut [u8; 8]>::try_from(filled).unwrap();
@@ -857,7 +920,10 @@ impl<'shared_is_alive> TrustedQueues<'shared_is_alive> {
 
         // Just a sanity test. This shouldn't refer to a member queue which can not be the server.
         let members = ring.heads.monitor().max_members.load(Ordering::Relaxed);
-        assert!(members < id.0, "That queue belongs to a member. Call as_member instead.");
+        assert!(
+            members < id.0,
+            "That queue belongs to a member. Call as_member instead."
+        );
 
         ring.heads.queues_controller(id)
     }
@@ -867,9 +933,18 @@ impl<'shared_is_alive> TrustedQueues<'shared_is_alive> {
 
         // Just a sanity test. This shouldn't refer to a member queue which can not be the server.
         let members = ring.heads.monitor().max_members.load(Ordering::Relaxed);
-        assert!(members < id.0, "That queue belongs to a member. Call as_member instead.");
+        assert!(
+            members < id.0,
+            "That queue belongs to a member. Call as_member instead."
+        );
 
         ring.heads.queues_controller(id).reverse()
+    }
+
+    pub fn as_socket(&self, id: ShmRingId) -> SocketQueue<'shared_is_alive> {
+        let ring = &self.inner.ring;
+        let queue = ring.heads.queues_controller(id);
+        SocketQueue { queue }
     }
 }
 
@@ -879,7 +954,10 @@ impl ShmHeads {
     /// Caller must guarantee that `ptr` can be dereferenced at least one page and that it points
     /// to a shm-ring shared memory page that has been mmap'ed into contiguous memory. Then this
     /// code will check all interior invariants to sanity check the whole thing.
-    pub(crate) unsafe fn from_monitor(ptr: ptr::NonNull<MonitorHead>, len: usize) -> Result<Self, OpenError> {
+    pub(crate) unsafe fn from_monitor(
+        ptr: ptr::NonNull<MonitorHead>,
+        len: usize,
+    ) -> Result<Self, OpenError> {
         // Check offsets against the total length.
         struct PageBound(u64);
 
@@ -935,8 +1013,7 @@ impl ShmHeads {
             return Err(OpenError);
         }
 
-        let open_offset = usize::try_from(open_offset)
-            .map_err(|_| OpenError)?;
+        let open_offset = usize::try_from(open_offset).map_err(|_| OpenError)?;
         let open_ptr = ptr::NonNull::new((ptr.as_ptr() as *mut u8).add(open_offset)).unwrap();
 
         Ok(ShmHeads {
@@ -958,8 +1035,10 @@ impl ShmHeads {
     pub(crate) fn member_list(&self) -> &[AtomicU64] {
         let space = OpenOptions::PAGE_SIZE - mem::size_of::<MonitorHead>();
         let max_members = self.monitor().max_members.load(Ordering::Relaxed) as usize;
-        assert!(space / mem::size_of::<AtomicU64>() >= max_members,
-            "Not enough space for inline member list. Should have caught this in constructor");
+        assert!(
+            space / mem::size_of::<AtomicU64>() >= max_members,
+            "Not enough space for inline member list. Should have caught this in constructor"
+        );
         let base = self.monitor.as_ptr();
         unsafe {
             // SAFETY: surely short enough, and enough space for max_members as validated above.
@@ -990,9 +1069,7 @@ impl ShmHeads {
         let start = self.monitor().head_start.load(Ordering::Relaxed) as usize;
         let offset = (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
-        unsafe {
-            ptr::NonNull::new(base.add(start).add(offset) as *mut QueueHead).unwrap()
-        }
+        unsafe { ptr::NonNull::new(base.add(start).add(offset) as *mut QueueHead).unwrap() }
     }
 
     fn queue_start(&self, this: ShmRingId) -> (ptr::NonNull<u64>, u32) {
@@ -1002,9 +1079,7 @@ impl ShmHeads {
         let pages = self.monitor().pages_per_queue.load(Ordering::Relaxed);
         let offset = 2 * pages as usize * (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
-        let head = unsafe {
-            ptr::NonNull::new(base.add(start).add(offset) as *mut u64).unwrap()
-        };
+        let head = unsafe { ptr::NonNull::new(base.add(start).add(offset) as *mut u64).unwrap() };
 
         (head, pages)
     }
@@ -1016,9 +1091,7 @@ impl ShmHeads {
         let pages = self.monitor().pages_per_scratch.load(Ordering::Relaxed);
         let offset = 2 * pages as usize * (this.0 as usize) * OpenOptions::PAGE_SIZE;
 
-        let head = unsafe {
-            ptr::NonNull::new(base.add(start).add(offset)).unwrap()
-        };
+        let head = unsafe { ptr::NonNull::new(base.add(start).add(offset)).unwrap() };
 
         (head, pages)
     }
@@ -1090,15 +1163,8 @@ impl ShmQueues {
         } else {
             (&queue.half_a, 0)
         };
-        let buffer = unsafe {
-            let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
-            let buffer = ptr::slice_from_raw_parts(addr, memory_per_queue);
-            &*(buffer as *const [AtomicU8])
-        };
-        ReadHalf {
-            inner,
-            buffer,
-        }
+        let buffer = unsafe { Self::queue_memory(self.private_queues, offset, memory_per_queue) };
+        ReadHalf { inner, buffer }
     }
 
     fn half_to_write_to(&mut self) -> WriteHalf<'_> {
@@ -1109,15 +1175,46 @@ impl ShmQueues {
         } else {
             (&queue.half_b, memory_per_queue)
         };
-        let buffer = unsafe {
-            let addr = (self.private_queues.as_ptr() as *mut u8).add(offset);
-            let buffer = ptr::slice_from_raw_parts(addr, memory_per_queue);
-            &*(buffer as *const [AtomicU8])
+        let buffer = unsafe { Self::queue_memory(self.private_queues, offset, memory_per_queue) };
+        WriteHalf { inner, buffer }
+    }
+
+    fn halves(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
+        let queue = unsafe { &*self.private_head.as_ptr() };
+        let memory_per_queue = self.pages_per_queue as usize * OpenOptions::PAGE_SIZE;
+
+        let (read, roffset, write, woffset) = if self.is_a_side {
+            (&queue.half_b, memory_per_queue, &queue.half_a, 0)
+        } else {
+            (&queue.half_a, 0, &queue.half_b, memory_per_queue)
         };
-        WriteHalf {
-            inner,
-            buffer,
-        }
+
+        let read_buffer =
+            unsafe { Self::queue_memory(self.private_queues, roffset, memory_per_queue) };
+        let write_buffer =
+            unsafe { Self::queue_memory(self.private_queues, woffset, memory_per_queue) };
+
+        let read_half = ReadHalf {
+            inner: read,
+            buffer: read_buffer,
+        };
+
+        let write_half = WriteHalf {
+            inner: write,
+            buffer: write_buffer,
+        };
+
+        (read_half, write_half)
+    }
+
+    unsafe fn queue_memory<'a>(
+        queues: ptr::NonNull<u64>,
+        offset: usize,
+        memory_per_queue: usize,
+    ) -> &'a [AtomicU8] {
+        let addr = (queues.as_ptr() as *mut u8).add(offset);
+        let buffer = ptr::slice_from_raw_parts(addr, memory_per_queue);
+        &*(buffer as *const [AtomicU8])
     }
 }
 
@@ -1215,10 +1312,17 @@ impl PreparedRead<'_> {
     fn commit(self) {
         if cfg!(debug_assertions) {
             let must_succeed = self.commit.inner.read_head.compare_exchange(
-                self.read_base, self.read_end, Ordering::Release, Ordering::Relaxed);
+                self.read_base,
+                self.read_end,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
             must_succeed.expect("Another thread accessed supposedly owned read head");
         } else {
-            self.commit.inner.read_head.store(self.read_end, Ordering::Release);
+            self.commit
+                .inner
+                .read_head
+                .store(self.read_end, Ordering::Release);
         }
     }
 }
@@ -1237,7 +1341,8 @@ impl WriteHalf<'_> {
         // by subtracting one (note after adding page size so no overflows) and then do a
         // comparison against that.
         let empty = ((reader + modulo - 1) - writer) % modulo;
-        if empty < count { // Strict, new end must be smaller than reader.
+        if empty < count {
+            // Strict, new end must be smaller than reader.
             None
         } else {
             Some((writer, empty + 1))
@@ -1287,10 +1392,17 @@ impl PreparedWrite<'_> {
         // eprintln!("{:p} {}", &self.commit.inner.write_head, self.write_end);
         if cfg!(debug_assertions) {
             let must_succeed = self.commit.inner.write_head.compare_exchange(
-                self.write_base, self.write_end, Ordering::Release, Ordering::Relaxed);
+                self.write_base,
+                self.write_end,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
             must_succeed.expect("Another thread accessed supposedly owned write head");
         } else {
-            self.commit.inner.write_head.store(self.write_end, Ordering::Release);
+            self.commit
+                .inner
+                .write_head
+                .store(self.write_end, Ordering::Release);
         }
     }
 }

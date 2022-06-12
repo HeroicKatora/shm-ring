@@ -1,9 +1,6 @@
 use super::{
-    Events,
     ReadHalf,
-    ShmController,
     ShmControllerRing,
-    ShmQueue,
 };
 
 use std::collections::HashMap;
@@ -53,7 +50,12 @@ pub struct ControlMessage {
 }
 
 /// A message passed on a socket-control queue.
-pub struct SocketMessage(ControlMessage);
+#[repr(C)]
+// TODO: may want to change Debug to something struct-like.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct SocketMessage {
+    pub op: u64,
+}
 
 pub struct ControlResponse<'ring> {
     pub msg: ControlMessage,
@@ -219,6 +221,24 @@ impl ControlMessage {
     }
 }
 
+impl SocketMessage {
+    pub(crate) fn with_result(self, val: u32) -> Self {
+        SocketMessage { op: self.op | u64::from(val) << 32 }
+    }
+
+    pub(crate) fn tag(self) -> Tag {
+        Tag(self.op as u16)
+    }
+
+    pub(crate) fn cmd(self) -> Cmd {
+        Cmd((self.op >> 16) as u16)
+    }
+
+    pub(crate) fn value0(self) -> u32 {
+        (self.op >> 32) as u32
+    }
+}
+
 impl From<PipeRequest> for ControlMessage {
     fn from(PipeRequest { tag, public_id }: PipeRequest) -> Self {
         ControlMessage::with_raw(Cmd::REQUEST_PIPE, tag).with_argument(public_id)
@@ -252,25 +272,13 @@ impl From<SocketCreate> for ControlMessage {
 impl From<SocketBind> for SocketMessage {
     fn from(SocketBind { port, tag }: SocketBind) -> Self {
         let ctrl = ControlMessage::with_raw(Cmd::SOCKET_BIND, tag).with_argument(port);
-        SocketMessage(ctrl)
+        SocketMessage { op: ctrl.op }
     }
 }
 
 impl From<SocketConnect> for ControlMessage {
     fn from(SocketConnect { port, tag }: SocketConnect) -> Self {
         ControlMessage::with_raw(Cmd::SOCKET_CONNECT, tag).with_argument(port)
-    }
-}
-
-/// Private implementation of commands.
-impl ControlMessage {
-    pub(crate) fn execute(
-        controller: &mut ShmController,
-        queue_owner: u32,
-        queue: ShmQueue<'_>,
-        events: Option<&mut Events>,
-    ) {
-        controller.state.execute_control(queue_owner, queue, events)
     }
 }
 
@@ -314,5 +322,9 @@ impl<'ring> ControlResponse<'ring> {
 
     pub fn value0(&self) -> u32 {
         self.msg.value0()
+    }
+
+    pub fn message(&self) -> ControlMessage {
+        self.msg
     }
 }
