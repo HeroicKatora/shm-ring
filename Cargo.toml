@@ -1,0 +1,9 @@
+[package]
+name = "user-ring"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.70"
+
+[dependencies]
+linux-futex = "0.2"
+memmap2 = "0.9"
