@@ -22,6 +22,8 @@ pub struct ServerConfig<'lt> {
 }
 
 #[derive(Clone, Copy)]
+// This is a constant, only has one allowed value, but we do not care. Might change or not.
+#[allow(dead_code)]
 pub struct RingVersion(u64);
 
 pub enum ServerError {

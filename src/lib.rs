@@ -14,3 +14,6 @@ pub mod client;
 mod data;
 pub mod frame;
 pub mod server;
+
+#[no_mangle]
+extern "C" fn user_ring_have() {}

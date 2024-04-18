@@ -8,6 +8,9 @@ rust-version = "1.70"
 linux-futex = "0.2"
 memmap2 = "0.9"
 
+[lib]
+crate-type = ["cdylib", "lib"]
+
 [dev-dependencies]
 tempfile = "3.10"
 
