@@ -115,7 +115,7 @@ impl dyn RetainedMemory {
         }
 
         let aligned_tail = tail.add(offset);
-        let aligned_size = offset - tail_size;
+        let aligned_size = tail_size - offset;
 
         let aligned_tail = ptr::slice_from_raw_parts(aligned_tail, aligned_size);
         let aligned_tail = unsafe { &*(aligned_tail as *const UnsafeCell<[u8]>) };

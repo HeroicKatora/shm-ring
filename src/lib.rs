@@ -12,4 +12,4 @@ extern crate alloc;
 
 mod data;
 pub mod frame;
-mod server;
+pub mod server;

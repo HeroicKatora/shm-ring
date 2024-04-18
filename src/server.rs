@@ -88,3 +88,15 @@ impl Server {
             })
     }
 }
+
+impl RingVersion {
+    pub const fn new() -> Self {
+        RingVersion(1)
+    }
+}
+
+impl Default for RingVersion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
