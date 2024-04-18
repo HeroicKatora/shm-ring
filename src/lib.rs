@@ -10,6 +10,7 @@ compile_error!("Requires 8-byte atomics operations");
 
 extern crate alloc;
 
+pub mod client;
 mod data;
 pub mod frame;
 pub mod server;
