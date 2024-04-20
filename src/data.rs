@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU64, AtomicU32};
 pub struct RingHead {
     pub ring_magic: RingMagic,
     pub ring_count: u64,
+    pub ring_offset: u64,
     pub ring_ping: RingPing,
 }
 
@@ -15,7 +16,7 @@ pub struct RingPing {
 }
 
 #[repr(transparent)]
-pub struct RingMagic(u64);
+pub struct RingMagic(pub(crate) u64);
 
 #[repr(C, align(4096))]
 pub struct Rings([RingInfo]);
@@ -83,4 +84,20 @@ impl RingMagic {
     pub fn test(&self) -> bool {
         self.0 == Self::MAGIC
     }
+}
+
+pub(crate) fn align_offset<U>(ptr: *const u8) -> usize {
+    let addr = ptr as usize;
+    addr.wrapping_neg() % core::mem::align_of::<U>()
+}
+
+#[test]
+fn align_offset_is_correct() {
+    assert_eq!(align_offset::<u64>(0usize as *const u8), 0);
+    assert_eq!(align_offset::<u64>(1usize as *const u8), 7);
+    assert_eq!(align_offset::<u64>(2usize as *const u8), 6);
+    assert_eq!(align_offset::<u64>(3usize as *const u8), 5);
+    assert_eq!(align_offset::<u64>(4usize as *const u8), 4);
+    assert_eq!(align_offset::<u64>(7usize as *const u8), 1);
+    assert_eq!(align_offset::<u64>(8usize as *const u8), 0);
 }

@@ -1,5 +1,5 @@
 use user_ring::frame::Shared;
-use user_ring::server::{ServerConfig, RingConfig, RingVersion};
+use user_ring::server::{RingConfig, RingVersion, ServerConfig};
 
 use memmap2::MmapRaw;
 use tempfile::NamedTempFile;
@@ -16,20 +16,22 @@ fn create_server() {
     // Fulfills all the pre-conditions of alignment to map.
     let shared = Shared::new(map).unwrap();
 
-    let rings = [
-        RingConfig {
-            version: RingVersion::default(),
-            ring_size: 0x10,
-            data_size: 0x1234,
-            slot_entry_size: 0x8,
-        }
-    ];
+    let rings = [RingConfig {
+        version: RingVersion::default(),
+        ring_size: 0x10,
+        data_size: 0x1234,
+        slot_entry_size: 0x8,
+    }];
 
-    let server = unsafe {
-        shared.into_server(ServerConfig {
-            vec: &rings,
-        })
-    };
+    let shared_client = shared.clone();
+    assert!(shared_client.into_client().is_err());
 
-    assert!(server.is_ok());
+    let shared_server = shared.clone();
+    let server = unsafe { shared_server.into_server(ServerConfig { vec: &rings }) };
+    let server = server.expect("Have initialized server");
+
+    let shared_client = shared.clone().into_client();
+    let client = shared_client.expect("Have initialized client");
+
+    let _ = (server, client);
 }

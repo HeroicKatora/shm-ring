@@ -1,8 +1,8 @@
-use core::sync::atomic;
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic;
 use core::{cell::UnsafeCell, mem, ptr};
 
-use crate::{data, server};
+use crate::{client, data, server};
 
 use memmap2::MmapRaw;
 
@@ -56,8 +56,14 @@ impl Shared {
         unsafe { server::Server::new(self.clone(), cfg) }
     }
 
-    pub fn into_client(&self) {
-        todo!()
+    /// Access this ring as a client.
+    ///
+    /// This does not join any specific ring, nor precludes the process from _also_ acting as a
+    /// server. Merely it checks if the server structure exists and can be utilized, as well as
+    /// resolve the addresses with a consistency check with the underlying mapped memory.
+    pub fn into_client(&self) -> Result<client::Client, client::ClientError> {
+        // Safety: exactly fulfills the preconditions, ours by definition.
+        unsafe { client::Client::new(self.clone()) }
     }
 
     /// Get the memory of the file, which is after the head page.
@@ -65,16 +71,37 @@ impl Shared {
         self.head.aligned_tail as *const UnsafeCell<[u8]>
     }
 
+    pub(crate) unsafe fn read_head(&self) -> Option<*const data::RingHead> {
+        let ptr = self.head.ring;
+        let magic = (*(ptr as *const atomic::AtomicU64)).load(atomic::Ordering::Relaxed);
+
+        if !data::RingMagic(magic).test() {
+            None
+        } else {
+            // Strengthen the load into an acquire, on success. This ensures all the other struct
+            // members and their access synchronize-with the magic, which has also been written as
+            // a release.
+            atomic::fence(atomic::Ordering::Acquire);
+            Some(ptr)
+        }
+    }
+
     pub(crate) unsafe fn init(
         &self,
-        head: data::RingHead,
+        mut head: data::RingHead,
     ) -> (*const data::RingHead, Weak<dyn RetainedMemory>) {
         assert_eq!(Arc::weak_count(&self._retain), 0);
         let ownership = Arc::downgrade(&self._retain);
+        let ptr = self.head.ring;
+
+        // To ensure and _ordering_ relation, we write this last and as an atomic with release
+        // ordering such that the volatile write of previous struct members is before for any
+        // reader that also inspects the magic with an atomic acquire load.
+        let magic = core::mem::replace(&mut head.ring_magic.0, 0);
 
         // Safety: as promised we currently own this address.
-        unsafe { ptr::write_volatile(self.head.ring, head) }
-        atomic::fence(atomic::Ordering::Release);
+        unsafe { ptr::write_volatile(ptr, head) }
+        (*(ptr as *const atomic::AtomicU64)).store(magic, atomic::Ordering::Release);
 
         (self.head.ring, ownership)
     }
