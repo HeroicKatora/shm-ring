@@ -1,5 +1,7 @@
 use user_ring::frame::Shared;
+use user_ring::data::{ClientIdentifier, RingIndex};
 use user_ring::server::{RingConfig, RingVersion, ServerConfig};
+use user_ring::client::{ClientSide, RingRequest};
 
 use memmap2::MmapRaw;
 use tempfile::NamedTempFile;
@@ -33,5 +35,13 @@ fn create_server() {
     let shared_client = shared.clone().into_client();
     let client = shared_client.expect("Have initialized client");
 
-    let _ = (server, client);
+    let tid = ClientIdentifier::new();
+    let join = client.join(&RingRequest {
+        side: ClientSide::Left,
+        index: RingIndex(0),
+        tid,
+    });
+
+    assert!(join.is_ok());
+    let _ = (server, client, join);
 }

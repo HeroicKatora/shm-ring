@@ -18,6 +18,16 @@ struct SharedHead {
     ring: *mut data::RingHead,
 }
 
+// Safety: Any such value must be accompanied by another (shared) owner of the memory backing it,
+// the creation of the value is contingent on the caller upholding that requirement. If the head
+// itself is sent the backing memory must be part of that transfer, keeping the head valid.
+unsafe impl Send for SharedHead {}
+// Safety: no shared reference created directly, all other synchronization is guarded by diverse
+// and specific preconditions. Callers then turn these assertions (such as: client's upholding the
+// basic access guarantees) into shared _references_ to the part of the ring's memory which they
+// need for their operations. Those references are required to be send, making this sync.
+unsafe impl Sync for SharedHead {}
+
 #[derive(Clone)]
 pub struct Shared {
     head: SharedHead,

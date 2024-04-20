@@ -11,8 +11,10 @@ compile_error!("Requires 8-byte atomics operations");
 extern crate alloc;
 
 pub mod client;
-mod data;
+pub mod data;
 pub mod frame;
+/// Contains all code to interacts with the OS directly.
+mod uapi;
 pub mod server;
 
 #[no_mangle]

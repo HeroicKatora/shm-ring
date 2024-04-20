@@ -5,8 +5,21 @@ edition = "2021"
 rust-version = "1.70"
 
 [dependencies]
+# Using the high-level crate instead of `libc` as an abstraction of safe
+# patterns. Also I'm hoping to encourage (myself, other authors) to contribute
+# towards such stable, idiomatic bindings as its official support list is
+# woeful.
+uapi = { version = "0.2.13", optional = true }
 linux-futex = "0.2"
 memmap2 = "0.9"
+
+[features]
+# We should call these required features, but the goal is to allow pivot to
+# some other OS-level integration if we need it. In particular, interacting
+# with the file paths and getting a pid might not even need the overheads of a
+# (synchronous) syscall if there are other strategies. We might have cached the
+# PID, want to do file traversal async, etc.
+default = ["uapi"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
