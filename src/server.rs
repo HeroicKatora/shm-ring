@@ -1,12 +1,31 @@
 use alloc::sync::Weak;
 use core::{cell, mem, ops, ptr};
 
-use crate::{data, frame};
+use hashbrown::{hash_map, HashMap, HashSet};
+
+use crate::{data, frame, uapi};
 
 pub struct Server {
+    /// Critical for safety, keeps the reference mappings in `server` alive.
+    #[allow(dead_code)]
     ring: frame::Shared,
     server: ServerHead,
+    /// For our inner sanity check, holding on to this informs the shared open mmap that a server
+    /// is running in our process. Re-using `Weak` since we do not have any use for an actual weak
+    /// reference to the `Arc` contents.
+    #[allow(dead_code)]
     owner: Weak<dyn frame::RetainedMemory>,
+}
+
+/// A handler for a server, running its obligated tasks.
+#[derive(Default)]
+pub struct ServerTask {
+    tracker: HashMap<data::ClientIdentifier, ClientTrackingData>,
+}
+
+struct ClientTrackingData {
+    pid: uapi::OwnedFd,
+    rings: HashSet<(usize, data::ClientSide)>,
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +66,20 @@ pub struct RingConfig {
 
 impl Server {
     const PAGE_SIZE: u64 = 4096;
+
+    /// Walk the ring info block, collecting PID file descriptors where necessary. It is the job of
+    /// the server to, eventually, deactivate the slot entries of crashed processes.
+    pub fn collect_fds(&self, track: &mut ServerTask) {
+        for (idx, info) in self.server.info.into_iter().enumerate() {
+            if let Ok(client) = info.lhs.inspect() {
+                track.track_client(client, idx, data::ClientSide::Left);
+            }
+
+            if let Ok(client) = info.rhs.inspect() {
+                track.track_client(client, idx, data::ClientSide::Right);
+            }
+        }
+    }
 
     /// Initialize a server, if the configuration checks out.
     ///
@@ -170,6 +203,28 @@ impl Server {
                 let off = if len % Self::PAGE_SIZE == 0 { 0 } else { 1 };
                 Ok(off + full)
             })
+    }
+}
+
+impl ServerTask {
+    fn track_client(&mut self, client: data::ClientIdentifier, idx: usize, side: data::ClientSide) {
+        let entry = match self.tracker.entry(client) {
+            hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hash_map::Entry::Vacant(entry) => {
+                // We're not going to track this client if we can't open its pid. Likely already
+                // recycled.
+                let Ok(pid) = client.open_pid() else {
+                    return;
+                };
+
+                entry.insert(ClientTrackingData {
+                    pid,
+                    rings: HashSet::new(),
+                })
+            }
+        };
+
+        entry.rings.insert((idx, side));
     }
 }
 

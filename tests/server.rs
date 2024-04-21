@@ -1,7 +1,7 @@
+use user_ring::client::RingRequest;
+use user_ring::data::{ClientIdentifier, ClientSide, RingIndex};
 use user_ring::frame::Shared;
-use user_ring::data::{ClientIdentifier, RingIndex};
 use user_ring::server::{RingConfig, RingVersion, ServerConfig};
-use user_ring::client::{ClientSide, RingRequest};
 
 use memmap2::MmapRaw;
 use tempfile::NamedTempFile;
@@ -36,12 +36,54 @@ fn create_server() {
     let client = shared_client.expect("Have initialized client");
 
     let tid = ClientIdentifier::new();
-    let join = client.join(&RingRequest {
+    let join_lhs = client.join(&RingRequest {
         side: ClientSide::Left,
         index: RingIndex(0),
         tid,
     });
 
-    assert!(join.is_ok());
-    let _ = (server, client, join);
+    assert!(join_lhs.is_ok());
+
+    {
+        // We can't join this another time..
+        let join = client.join(&RingRequest {
+            side: ClientSide::Left,
+            index: RingIndex(0),
+            tid,
+        });
+
+        assert!(join.is_err());
+    }
+
+    {
+        // We can't join this non-existing ring.
+        let join = client.join(&RingRequest {
+            side: ClientSide::Left,
+            index: RingIndex(1),
+            tid,
+        });
+
+        assert!(join.is_err());
+    }
+
+    let tid = ClientIdentifier::new();
+    let join_rhs = client.join(&RingRequest {
+        side: ClientSide::Right,
+        index: RingIndex(0),
+        tid,
+    });
+
+    assert!(join_rhs.is_ok());
+    drop(join_rhs);
+
+    // We can join it again.
+    let tid = ClientIdentifier::new();
+    let join_rhs = client.join(&RingRequest {
+        side: ClientSide::Right,
+        index: RingIndex(0),
+        tid,
+    });
+
+    assert!(join_rhs.is_ok());
+    let _ = (server, client);
 }

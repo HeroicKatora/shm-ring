@@ -1,5 +1,5 @@
 //! Defines the central data structures.
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, ops};
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 #[repr(C)]
@@ -40,6 +40,16 @@ pub struct RingServerPong(pub AtomicU32);
 #[repr(transparent)]
 pub struct ClientSlot(pub AtomicI64);
 
+/// Identifies the side of the ring.
+///
+/// A ring is, from the high-level view, a connection between two equals. There is no ordering
+/// relationship here. Of course, specific rings may disagree with that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClientSide {
+    Left,
+    Right,
+}
+
 /// An offset within into the head structure of the ring, from the ring info struct (by
 /// convention that is the start of the shared memory file).
 #[repr(transparent)]
@@ -78,11 +88,11 @@ pub struct RingInfo {
     // Here we are at 16 · 8 byte
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ClientIdentifier(pub(crate) u64);
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct RingIdentifier(pub(crate) i64);
 
@@ -101,6 +111,35 @@ impl RingMagic {
 impl Rings {
     pub fn get(&self, RingIndex(idx): RingIndex) -> Option<&RingInfo> {
         self.0.get(idx as usize)
+    }
+}
+
+impl<'lt> IntoIterator for &'lt Rings {
+    type Item = &'lt RingInfo;
+    type IntoIter = core::slice::Iter<'lt, RingInfo>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl ClientSide {
+    pub(crate) fn select(self, ring: &RingInfo) -> &ClientSlot {
+        match self {
+            ClientSide::Left => &ring.lhs,
+            ClientSide::Right => &ring.rhs,
+        }
+    }
+}
+
+impl ops::Not for ClientSide {
+    type Output = ClientSide;
+
+    fn not(self) -> ClientSide {
+        match self {
+            ClientSide::Left => ClientSide::Right,
+            ClientSide::Right => ClientSide::Left,
+        }
     }
 }
 
@@ -136,6 +175,16 @@ impl ClientSlot {
                 Ordering::Relaxed,
             )
             .map(|_| ())
+    }
+
+    pub fn inspect(&self) -> Result<ClientIdentifier, RingIdentifier> {
+        let id = self.0.load(Ordering::Relaxed);
+
+        if id > 0 {
+            Ok(ClientIdentifier(id as u64))
+        } else {
+            Err(RingIdentifier(id))
+        }
     }
 }
 

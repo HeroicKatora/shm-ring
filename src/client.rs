@@ -14,19 +14,9 @@ pub struct Ring {
     ring_id: data::RingIdentifier,
 }
 
-/// Identifies the side of the ring.
-///
-/// A ring is, from the high-level view, a connection between two equals. There is no ordering
-/// relationship here. Of course, specific rings may disagree with that.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ClientSide {
-    Left,
-    Right,
-}
-
 pub struct RingRequest {
     pub index: data::RingIndex,
-    pub side: ClientSide,
+    pub side: data::ClientSide,
     pub tid: data::ClientIdentifier,
 }
 
@@ -57,7 +47,7 @@ struct ClientHead {
 
 struct OwnedRingInfo {
     head: &'static data::RingInfo,
-    side: ClientSide,
+    side: data::ClientSide,
     identity: data::ClientIdentifier,
 }
 
@@ -148,26 +138,6 @@ impl Client {
             frame,
             ring_id,
         })
-    }
-}
-
-impl ClientSide {
-    fn select(self, ring: &data::RingInfo) -> &data::ClientSlot {
-        match self {
-            ClientSide::Left => &ring.lhs,
-            ClientSide::Right => &ring.rhs,
-        }
-    }
-}
-
-impl ops::Not for ClientSide {
-    type Output = ClientSide;
-
-    fn not(self) -> ClientSide {
-        match self {
-            ClientSide::Left => ClientSide::Right,
-            ClientSide::Right => ClientSide::Left,
-        }
     }
 }
 
