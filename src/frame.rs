@@ -6,7 +6,7 @@ use crate::{client, data, server};
 
 use memmap2::MmapRaw;
 
-pub unsafe trait RetainedMemory {
+pub unsafe trait RetainedMemory: Send + Sync {
     fn data_from_head(&self) -> *mut [u8];
 }
 

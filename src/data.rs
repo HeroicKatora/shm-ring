@@ -95,10 +95,10 @@ pub struct RingInfo {
     pub size_slot_entry: u64,
     // Here we are at 8 · 8 byte.
     pub lhs: ClientSlot,
-    pub _padding0: UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>,
+    pub _padding0: NoAccess<UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>>,
     // Here we are at 12 · 8 byte
     pub rhs: ClientSlot,
-    pub _padding1: UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>,
+    pub _padding1: NoAccess<UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>>,
     // Here we are at 16 · 8 byte
 }
 
@@ -111,10 +111,23 @@ pub struct RingHead {
 #[repr(C)]
 pub struct RingHeadHalf {
     pub producer: AtomicU32,
-    pub _padding0: UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>,
+    pub _padding0: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
     pub consumer: AtomicU32,
-    pub _padding1: UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>,
+    pub _padding1: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
 }
+
+/// Wraps memory, not allowing *any* access.
+///
+/// This allows containers with such fields (for padding) to be `Sync`.
+#[repr(transparent)]
+pub struct NoAccess<T>(T);
+
+// Safety: no `&T` can even be created, so this is always sound.
+unsafe impl<T> Sync for NoAccess<T> {}
+// Safety: `Copy` ensures that the value, if any, is completely inert. Since no reference, nor
+// owned value, to it can be created after wrapping it in `NoAccess` there can be no code relying
+// on any invariants that are broken by viewing the bytes in a different thread.
+unsafe impl<T: Copy> Send for NoAccess<T> {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
