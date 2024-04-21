@@ -50,6 +50,7 @@ pub enum RingJoinError {
 struct ClientHead {
     /// The frozen head.
     pub head: &'static data::RingHead,
+    // FIXME: not necessarily correct. We only know if a ring is `Rings` if they are V1.
     pub rings: &'static data::Rings,
     // FIXME: missing tail for data pages, and that tail's total offset.
 }

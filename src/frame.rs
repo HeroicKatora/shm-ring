@@ -81,6 +81,12 @@ impl Shared {
         self.head.aligned_tail as *const UnsafeCell<[u8]>
     }
 
+    pub fn tail_offset(&self) -> usize {
+        let aligned_addr = self.head.aligned_tail as *const _ as *const u8 as usize;
+        let head_addr = self.head.all as *const _ as *const u8 as usize;
+        aligned_addr - head_addr
+    }
+
     pub(crate) unsafe fn read_head(&self) -> Option<*const data::RingHead> {
         let ptr = self.head.ring;
         let magic = (*(ptr as *const atomic::AtomicU64)).load(atomic::Ordering::Relaxed);

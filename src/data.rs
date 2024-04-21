@@ -1,4 +1,5 @@
 //! Defines the central data structures.
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 #[repr(C)]
@@ -70,10 +71,10 @@ pub struct RingInfo {
     pub size_slot_entry: u64,
     // Here we are at 8 · 8 byte.
     pub lhs: ClientSlot,
-    pub _padding0: [u64; 3],
+    pub _padding0: UnsafeCell<[u64; 3]>,
     // Here we are at 12 · 8 byte
     pub rhs: ClientSlot,
-    pub _padding1: [u64; 3],
+    pub _padding1: UnsafeCell<[u64; 3]>,
     // Here we are at 16 · 8 byte
 }
 
