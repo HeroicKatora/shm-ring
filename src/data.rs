@@ -1,9 +1,11 @@
 //! Defines the central data structures.
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::{cell::UnsafeCell, ops};
-use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+
+use linux_futex::AsFutex;
 
 #[repr(C)]
-pub struct RingHead {
+pub struct ShmHead {
     pub ring_magic: RingMagic,
     pub ring_count: u64,
     pub ring_offset: u64,
@@ -37,8 +39,16 @@ pub struct RingClientPing(pub AtomicU32);
 pub struct RingServerPong(pub AtomicU32);
 
 /// A slot with which a client can register to a ring..
-#[repr(transparent)]
-pub struct ClientSlot(pub AtomicI64);
+#[repr(C, align(64))]
+pub struct ClientSlot {
+    /// The current owner of this slot. That is:
+    /// - a positive value, always a PID, if the slot is owned by a process.
+    /// - `0` if the slot is owned by the coordination authority.
+    /// - a negative value if the slot is available, advertising some tag.
+    pub owner: AtomicU32,
+    /// An additional info advertised by the owner. Only the owner should write here.
+    pub tag: AtomicU32,
+}
 
 /// Identifies the side of the ring.
 ///
@@ -54,6 +64,9 @@ pub enum ClientSide {
 /// convention that is the start of the shared memory file).
 #[repr(transparent)]
 pub struct ShOffset(pub u64);
+
+/// Number of U32 values to pad, to avoid cache interference between atomics.
+const ANTI_INTERFERENCE_PADDING_U32: usize = 31;
 
 /// Published by the server, information on the ring and a slot for registering as a client to the
 /// ring via an atomic CAS.
@@ -81,11 +94,25 @@ pub struct RingInfo {
     pub size_slot_entry: u64,
     // Here we are at 8 · 8 byte.
     pub lhs: ClientSlot,
-    pub _padding0: UnsafeCell<[u64; 3]>,
+    pub _padding0: UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>,
     // Here we are at 12 · 8 byte
     pub rhs: ClientSlot,
-    pub _padding1: UnsafeCell<[u64; 3]>,
+    pub _padding1: UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>,
     // Here we are at 16 · 8 byte
+}
+
+#[repr(C)]
+pub struct RingHead {
+    pub lhs: RingHeadHalf,
+    pub rhs: RingHeadHalf,
+}
+
+#[repr(C)]
+pub struct RingHeadHalf {
+    pub producer: AtomicU32,
+    pub _padding0: UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>,
+    pub consumer: AtomicU32,
+    pub _padding1: UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -94,7 +121,7 @@ pub struct ClientIdentifier(pub(crate) u64);
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct RingIdentifier(pub(crate) i64);
+pub struct RingIdentifier(pub(crate) i32);
 
 impl RingMagic {
     const MAGIC: u64 = 0x9e6c_a4fd8624a738;
@@ -123,15 +150,6 @@ impl<'lt> IntoIterator for &'lt Rings {
     }
 }
 
-impl ClientSide {
-    pub(crate) fn select(self, ring: &RingInfo) -> &ClientSlot {
-        match self {
-            ClientSide::Left => &ring.lhs,
-            ClientSide::Right => &ring.rhs,
-        }
-    }
-}
-
 impl ops::Not for ClientSide {
     type Output = ClientSide;
 
@@ -143,22 +161,47 @@ impl ops::Not for ClientSide {
     }
 }
 
+impl ClientIdentifier {
+    pub fn to_slot_id(self) -> u32 {
+        let client = self.0 as i32;
+        // As promised by the constructor in `uapi.rs`
+        assert!(client > 0, "Invalid client ID");
+        client as u32
+    }
+}
+
+impl RingIdentifier {
+    pub fn to_slot_id(self) -> u32 {
+        self.0 as u32
+    }
+}
+
 impl ClientSlot {
+    pub(crate) fn for_advertisement(owner: i32, tag: u32) -> Self {
+        assert!(owner < 0);
+
+        ClientSlot {
+            owner: (owner as u32).into(),
+            tag: tag.into(),
+        }
+    }
+
     /// Atomically exchange the slot with a request to join with a specific client.
     pub fn insert(&self, client: ClientIdentifier) -> Result<RingIdentifier, ClientIdentifier> {
-        let client = client.0 as i64;
+        let client = client.0 as i32;
         assert!(client > 0, "Invalid client ID");
+        let client = client as u32;
 
         // FIXME: this is a problem if we have heavy contention ABA to a ring. Luckily, we assume
         // that this is not the case.. However, maybe we shouldn't spin-lock forever on this?
-        let acquisition = self
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(client).filter(|_| n <= 0)
-            });
+        let acquisition =
+            self.owner
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n: u32| {
+                    Some(client).filter(|_| n as i32 <= 0)
+                });
 
         match acquisition {
-            Ok(id) => Ok(RingIdentifier(id)),
+            Ok(id) => Ok(RingIdentifier(id as i32)),
             Err(id) => {
                 debug_assert!(id > 0);
                 Err(ClientIdentifier(id as u64))
@@ -166,11 +209,11 @@ impl ClientSlot {
         }
     }
 
-    pub fn leave(&self, id: ClientIdentifier) -> Result<(), i64> {
-        self.0
+    pub fn leave(&self, id: ClientIdentifier) -> Result<(), u32> {
+        self.owner
             .compare_exchange_weak(
-                id.0 as i64,
-                RingIdentifier::default().0,
+                id.to_slot_id(),
+                RingIdentifier::default().to_slot_id(),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             )
@@ -178,12 +221,40 @@ impl ClientSlot {
     }
 
     pub fn inspect(&self) -> Result<ClientIdentifier, RingIdentifier> {
-        let id = self.0.load(Ordering::Relaxed);
+        let id: u32 = self.owner.load(Ordering::Relaxed);
+        let id = id as i32;
 
         if id > 0 {
             Ok(ClientIdentifier(id as u64))
         } else {
-            Err(RingIdentifier(id))
+            Err(RingIdentifier(id as i32))
+        }
+    }
+}
+
+impl RingInfo {
+    /// Leave a ring, as an owner of a side.
+    ///
+    /// This will atomically swap the client slot for `0` and wake any futex waiting on the head of
+    /// the queue of the side being left, if any.
+    pub fn leave_as_owner_with_futex(&self, side: ClientSide, head: &RingHead) {
+        let slot = self.select_slot(side);
+        todo!()
+    }
+
+    pub fn select_slot(&self, side: ClientSide) -> &ClientSlot {
+        match side {
+            ClientSide::Left => &self.lhs,
+            ClientSide::Right => &self.rhs,
+        }
+    }
+}
+
+impl RingHead {
+    pub fn select_producer(&self, side: ClientSide) -> &AtomicU32 {
+        match side {
+            ClientSide::Left => &self.lhs.producer,
+            ClientSide::Right => &self.rhs.producer,
         }
     }
 }

@@ -1,4 +1,4 @@
-use core::{mem, ops, ptr, sync::atomic};
+use core::{mem, ptr, sync::atomic};
 
 use crate::{data, frame};
 
@@ -9,7 +9,7 @@ pub struct Client {
 
 pub struct Ring {
     ring: frame::Shared,
-    frame: RingHead,
+    frame: RingMap,
     /// The ID which we acquired the slot from.
     ring_id: data::RingIdentifier,
 }
@@ -39,7 +39,7 @@ pub enum RingJoinError {
 #[derive(Clone, Copy)]
 struct ClientHead {
     /// The frozen head.
-    pub head: &'static data::RingHead,
+    pub head: &'static data::ShmHead,
     // FIXME: not necessarily correct. We only know if a ring is `Rings` if they are V1.
     pub rings: &'static data::Rings,
     // FIXME: missing tail for data pages, and that tail's total offset.
@@ -51,8 +51,8 @@ struct OwnedRingInfo {
     identity: data::ClientIdentifier,
 }
 
-struct RingHead {
-    head: &'static data::RingHead,
+struct RingMap {
+    head: &'static data::ShmHead,
     info: OwnedRingInfo,
 }
 
@@ -118,7 +118,7 @@ impl Client {
             return Err(RingJoinError::Unsupported);
         }
 
-        let slot = req.side.select(&ring_info);
+        let slot = ring_info.select_slot(req.side);
         let ring_id = slot.insert(req.tid).map_err(RingJoinError::Taken)?;
 
         // Immediately afterwards we are responsible for that region.
@@ -128,7 +128,7 @@ impl Client {
             side: req.side,
         };
 
-        let frame = RingHead {
+        let frame = RingMap {
             head: self.head.head,
             info: owned_ring,
         };
@@ -145,6 +145,6 @@ impl Ring {}
 
 impl Drop for OwnedRingInfo {
     fn drop(&mut self) {
-        let _ = self.side.select(&self.head).leave(self.identity);
+        let _ = self.head.select_slot(self.side).leave(self.identity);
     }
 }

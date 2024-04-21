@@ -9,7 +9,7 @@ pub struct Server {
     /// Critical for safety, keeps the reference mappings in `server` alive.
     #[allow(dead_code)]
     ring: frame::Shared,
-    server: ServerHead,
+    server: ServerMap,
     /// For our inner sanity check, holding on to this informs the shared open mmap that a server
     /// is running in our process. Re-using `Weak` since we do not have any use for an actual weak
     /// reference to the `Arc` contents.
@@ -29,9 +29,9 @@ struct ClientTrackingData {
 }
 
 #[derive(Clone, Copy)]
-struct ServerHead {
+struct ServerMap {
     /// The frozen head.
-    pub head: &'static data::RingHead,
+    pub head: &'static data::ShmHead,
     pub info: &'static data::Rings,
     pub data: &'static cell::UnsafeCell<[u8]>,
 }
@@ -119,7 +119,7 @@ impl Server {
         Self::offsets(unsafe { &mut *rings }, cfg.vec, offset..end_offset)?;
 
         let tail = ptr::slice_from_raw_parts(tail, tail_size);
-        let head = data::RingHead {
+        let head = data::ShmHead {
             ring_magic: data::RingMagic::new(),
             ring_offset: ring_offset
                 .try_into()
@@ -133,7 +133,7 @@ impl Server {
         let (head, owner) = unsafe { ring.init(head) };
 
         // Safety: all properly initialized at this point.
-        let server = ServerHead {
+        let server = ServerMap {
             head: unsafe { &*head },
             info: unsafe { &*(rings as *const data::Rings) },
             data: unsafe { &*(tail as *const cell::UnsafeCell<[u8]>) },
@@ -189,8 +189,8 @@ impl Server {
             info.size_ring = cfg.ring_size;
             info.size_data = cfg.data_size;
             info.size_slot_entry = cfg.slot_entry_size;
-            info.lhs = data::ClientSlot(0.into());
-            info.rhs = data::ClientSlot(0.into());
+            info.lhs = data::ClientSlot::for_advertisement(-1i32, 0);
+            info.rhs = data::ClientSlot::for_advertisement(-1i32, 0);
         }
 
         Ok(())

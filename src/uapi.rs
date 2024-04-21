@@ -10,7 +10,7 @@ const _: () = {
     // The assertion here serves as a warning: we *can* provide facilities to make construction
     // fallible, but doing so might be much more tedious.
     assert!(
-        core::mem::size_of::<uapi::c::pid_t>() < core::mem::size_of::<ClientIdInt>(),
+        core::mem::size_of::<uapi::c::pid_t>() == 4,
         "The platform you're using can not guarantee that PIDs can atomically replace slots in ring
         registration. Please open a pull-request for fallible interfaces instead."
     );

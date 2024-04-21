@@ -15,7 +15,7 @@ struct SharedHead {
     #[allow(dead_code)]
     all: &'static UnsafeCell<[u8]>,
     aligned_tail: &'static UnsafeCell<[u8]>,
-    ring: *mut data::RingHead,
+    ring: *mut data::ShmHead,
 }
 
 // Safety: Any such value must be accompanied by another (shared) owner of the memory backing it,
@@ -87,7 +87,7 @@ impl Shared {
         aligned_addr - head_addr
     }
 
-    pub(crate) unsafe fn read_head(&self) -> Option<*const data::RingHead> {
+    pub(crate) unsafe fn read_head(&self) -> Option<*const data::ShmHead> {
         let ptr = self.head.ring;
         let magic = (*(ptr as *const atomic::AtomicU64)).load(atomic::Ordering::Relaxed);
 
@@ -104,8 +104,8 @@ impl Shared {
 
     pub(crate) unsafe fn init(
         &self,
-        mut head: data::RingHead,
-    ) -> (*const data::RingHead, Weak<dyn RetainedMemory>) {
+        mut head: data::ShmHead,
+    ) -> (*const data::ShmHead, Weak<dyn RetainedMemory>) {
         assert_eq!(Arc::weak_count(&self._retain), 0);
         let ownership = Arc::downgrade(&self._retain);
         let ptr = self.head.ring;
@@ -138,20 +138,20 @@ impl dyn RetainedMemory {
         let data = unsafe { &*(data as *mut UnsafeCell<[u8]>) };
         let size = mem::size_of_val(data);
 
-        if size < mem::size_of::<data::RingHead>() {
+        if size < mem::size_of::<data::ShmHead>() {
             return None;
         }
 
-        if (data.get() as *const u8 as usize) % mem::align_of::<data::RingHead>() != 0 {
+        if (data.get() as *const u8 as usize) % mem::align_of::<data::ShmHead>() != 0 {
             return None;
         }
 
         // Safety: lifetime enlarged by caller, otherwise this is a no-op.
-        let ring = data.get() as *mut data::RingHead;
-        let tail = (data.get() as *const u8).add(mem::size_of::<data::RingHead>());
-        let tail_size = size - mem::size_of::<data::RingHead>();
+        let ring = data.get() as *mut data::ShmHead;
+        let tail = (data.get() as *const u8).add(mem::size_of::<data::ShmHead>());
+        let tail_size = size - mem::size_of::<data::ShmHead>();
 
-        let offset = tail.align_offset(mem::align_of::<data::RingHead>());
+        let offset = tail.align_offset(mem::align_of::<data::ShmHead>());
 
         if offset > tail_size {
             return None;
