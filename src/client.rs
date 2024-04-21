@@ -1,4 +1,4 @@
-use core::{mem, ptr, sync::atomic};
+use core::{alloc, mem, ptr, sync::atomic};
 
 use crate::{data, frame};
 
@@ -32,6 +32,9 @@ pub enum ClientError {
 #[derive(Debug)]
 pub enum RingJoinError {
     BadRingIndex,
+    BadRingOffsetHead,
+    BadRingOffsetData,
+    BadRingOffsetRing,
     Unsupported,
     Taken(data::ClientIdentifier),
 }
@@ -46,7 +49,8 @@ struct ClientHead {
 }
 
 struct OwnedRingInfo {
-    head: &'static data::RingInfo,
+    info: &'static data::RingInfo,
+    head: &'static data::RingHead,
     side: data::ClientSide,
     identity: data::ClientIdentifier,
 }
@@ -118,13 +122,30 @@ impl Client {
             return Err(RingJoinError::Unsupported);
         }
 
+        let head = ring
+            .get_aligned_data_at_offset::<data::RingHead>(ring_info.offset_head)
+            .ok_or(RingJoinError::BadRingOffsetHead)?;
+
+        let ring_layout = Self::spec_as_layout(ring_info.size_ring, ring_info.size_slot_entry)
+            .ok_or(RingJoinError::BadRingOffsetRing)?;
+        let _ = ring
+            .get_aligned_data_at_offset_val(ring_info.offset_ring, ring_layout)
+            .ok_or(RingJoinError::BadRingOffsetRing)?;
+
+        let data_layout = Self::spec_as_layout(ring_info.size_data, 1u64)
+            .ok_or(RingJoinError::BadRingOffsetRing)?;
+        let _ = ring
+            .get_aligned_data_at_offset_val(ring_info.offset_data, data_layout)
+            .ok_or(RingJoinError::BadRingOffsetRing)?;
+
         let slot = ring_info.select_slot(req.side);
         let ring_id = slot.insert(req.tid).map_err(RingJoinError::Taken)?;
 
         // Immediately afterwards we are responsible for that region.
         let owned_ring = OwnedRingInfo {
+            head: unsafe { &*head },
             identity: req.tid,
-            head: ring_info,
+            info: ring_info,
             side: req.side,
         };
 
@@ -139,12 +160,18 @@ impl Client {
             ring_id,
         })
     }
+
+    fn spec_as_layout(size: u64, align: u64) -> Option<alloc::Layout> {
+        let size: usize = size.try_into().ok()?;
+        let align: usize = align.try_into().ok()?;
+        alloc::Layout::from_size_align(size, align).ok()
+    }
 }
 
 impl Ring {}
 
 impl Drop for OwnedRingInfo {
     fn drop(&mut self) {
-        let _ = self.head.select_slot(self.side).leave(self.identity);
+        self.info.leave_as_owner_with_futex(self.side, self.head);
     }
 }

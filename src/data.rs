@@ -1,8 +1,8 @@
 //! Defines the central data structures.
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use core::{cell::UnsafeCell, ops};
+use core::{alloc, cell::UnsafeCell, ops};
 
-use linux_futex::AsFutex;
+use linux_futex::{op as futop, AsFutex, Futex, Shared};
 
 #[repr(C)]
 pub struct ShmHead {
@@ -62,6 +62,7 @@ pub enum ClientSide {
 
 /// An offset within into the head structure of the ring, from the ring info struct (by
 /// convention that is the start of the shared memory file).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ShOffset(pub u64);
 
@@ -238,8 +239,13 @@ impl RingInfo {
     /// This will atomically swap the client slot for `0` and wake any futex waiting on the head of
     /// the queue of the side being left, if any.
     pub fn leave_as_owner_with_futex(&self, side: ClientSide, head: &RingHead) {
-        let slot = self.select_slot(side);
-        todo!()
+        let slot: &Futex<Shared> = self.select_slot(side).owner.as_futex();
+        let head: &Futex<Shared> = head.select_producer(side).as_futex();
+
+        // Effectively: always assign, always wake since the current value _must_ be our own PID if
+        // used correctly. We only really use `> 0` as dummy for bad usage.
+        let op = futop::Op::assign(0) + futop::Cmp::ge(0);
+        head.wake_op(i32::MAX, slot, op, i32::MAX);
     }
 
     pub fn select_slot(&self, side: ClientSide) -> &ClientSlot {
@@ -260,8 +266,12 @@ impl RingHead {
 }
 
 pub(crate) fn align_offset<U>(ptr: *const u8) -> usize {
+    align_offset_val(ptr, alloc::Layout::new::<U>())
+}
+
+pub(crate) fn align_offset_val(ptr: *const u8, layout: alloc::Layout) -> usize {
     let addr = ptr as usize;
-    addr.wrapping_neg() % core::mem::align_of::<U>()
+    addr.wrapping_neg() % layout.align()
 }
 
 #[test]

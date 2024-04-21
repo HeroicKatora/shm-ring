@@ -1,6 +1,6 @@
-use alloc::sync::{Arc, Weak};
+use ::alloc::sync::{Arc, Weak};
 use core::sync::atomic;
-use core::{cell::UnsafeCell, mem, ptr};
+use core::{alloc, cell::UnsafeCell, mem, ptr};
 
 use crate::{client, data, server};
 
@@ -85,6 +85,40 @@ impl Shared {
         let aligned_addr = self.head.aligned_tail as *const _ as *const u8 as usize;
         let head_addr = self.head.all as *const _ as *const u8 as usize;
         aligned_addr - head_addr
+    }
+
+    pub(crate) fn get_aligned_data_at_offset<T>(&self, offset: data::ShOffset) -> Option<*const T> {
+        let layout = alloc::Layout::new::<T>();
+        let ptr = self.get_aligned_data_at_offset_val(offset, layout)?;
+        debug_assert_eq!(mem::size_of_val(unsafe { &*ptr }), layout.size());
+        Some(ptr as *const u8 as *const T)
+    }
+
+    pub(crate) fn get_aligned_data_at_offset_val(
+        &self,
+        data::ShOffset(offset): data::ShOffset,
+        layout: alloc::Layout,
+    ) -> Option<*const [u8]> {
+        let tail_offset: u64 = self.tail_offset().try_into().ok()?;
+        // Re-base offsets etc onto actual tail data.
+        let offset = offset.checked_sub(tail_offset)?;
+        let tail = self.tail();
+        // Safety: still valid, `&self` protects that memory mapping.
+        let max_offset = core::mem::size_of_val(unsafe { &*tail }).checked_sub(layout.size())?;
+
+        if offset.try_into().map_or(true, |n: usize| n > max_offset) {
+            return None;
+        }
+
+        // As verified by comparison, this fits in a usize and is valid within the tail.
+        let start = unsafe { UnsafeCell::raw_get(tail).cast::<u8>().add(offset as usize) };
+
+        if data::align_offset_val(start, layout) != 0 {
+            return None;
+        }
+
+        // Safety: offset + size fits into `size_of_val(tail)`.
+        Some(ptr::slice_from_raw_parts(start, layout.size()))
     }
 
     pub(crate) unsafe fn read_head(&self) -> Option<*const data::ShmHead> {
