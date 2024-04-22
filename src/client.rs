@@ -1,4 +1,6 @@
-use core::{alloc, mem, ptr, sync::atomic};
+use core::{alloc, mem, ptr, sync::atomic, time};
+
+use linux_futex::{AsFutex, Futex, Shared};
 
 use crate::{data, frame};
 
@@ -9,7 +11,7 @@ pub struct Client {
 
 pub struct Ring {
     ring: frame::Shared,
-    frame: RingMap,
+    map: RingMap,
     /// The ID which we acquired the slot from.
     ring_id: data::RingIdentifier,
 }
@@ -48,7 +50,7 @@ struct ClientHead {
     // FIXME: missing tail for data pages, and that tail's total offset.
 }
 
-struct OwnedRingInfo {
+struct OwnedRingSlot {
     info: &'static data::RingInfo,
     head: &'static data::RingHead,
     side: data::ClientSide,
@@ -57,7 +59,7 @@ struct OwnedRingInfo {
 
 struct RingMap {
     head: &'static data::ShmHead,
-    info: OwnedRingInfo,
+    slot: OwnedRingSlot,
 }
 
 impl Client {
@@ -142,7 +144,7 @@ impl Client {
         let ring_id = slot.insert(req.tid).map_err(RingJoinError::Taken)?;
 
         // Immediately afterwards we are responsible for that region.
-        let owned_ring = OwnedRingInfo {
+        let owned_ring = OwnedRingSlot {
             head: unsafe { &*head },
             identity: req.tid,
             info: ring_info,
@@ -151,12 +153,12 @@ impl Client {
 
         let frame = RingMap {
             head: self.head.head,
-            info: owned_ring,
+            slot: owned_ring,
         };
 
         Ok(Ring {
             ring,
-            frame,
+            map: frame,
             ring_id,
         })
     }
@@ -168,9 +170,68 @@ impl Client {
     }
 }
 
-impl Ring {}
+impl Ring {
+    /// Wait on the other side to move the head and wake us.
+    ///
+    /// Alternatively, the operation may be woken by the coordination authority if the PID
+    /// controlling the other half of this ring dropped out abnormally. Returns `true` if the wait
+    /// was successfully completed by a `wake`. Returns `false` if the other half already left the
+    /// ring, leaves the ring normally while waiting, is reaped by the authority, or a timeout
+    /// occurs.
+    pub fn wait(&self, timeout: time::Duration) -> bool {
+        // Does a bit of a weird dance.. We wait on the _slot_ and not the head counter. The reason
+        // here is that it is the _slot_ which must stay constant primarily as one must only wait
+        // while there is an active PID on the other side. We rely on the other side to requeue us
+        // to the actual head before the notify waiters. Which is absolutely odd, but what can you
+        // do.
+        //
+        // I'd like a `FUTEX_WAIT2` operation which enqueues us to a futex based on the atomic
+        // comparison with another futex's value?
+        //
+        // But really it isn't critical whether the head's value is still as expected, as long as
+        // the other half is alive it should periodically re-check even when it has woken on some
+        // particular head value. Hence, we do not actually race with an update to the head? This
+        // is very surprising..
+        //
+        // The only real alternative would be us spawning a separate thread wherein we can, for all
+        // blocked heads, do a `FUTEX_WAKE_OP` on the producer, with the cached previously loaded
+        // value, to wake our futexes blocked on the slot when the producer changed to simulate
+        // parts of the effect of having checked two values.
+        let other = self.map.slot.info.select_slot(!self.map.slot.side);
+        let owner = other.owner.load(atomic::Ordering::Relaxed);
 
-impl Drop for OwnedRingInfo {
+        // Do not wait if there is no other side anymore (or yet)..
+        if (owner as i32) <= 0 {
+            return false;
+        }
+
+        let slot: &Futex<Shared> = other.owner.as_futex();
+        slot.wait_for(owner, timeout).is_ok()
+    }
+
+    pub fn wake(&self) -> u32 {
+        self.map.slot.wake()
+    }
+}
+
+impl OwnedRingSlot {
+    pub fn wake(&self) -> u32 {
+        // See `Ring::wait` for an explanation of this dance.
+        let slot = self.info.select_slot(self.side);
+        let slot: &Futex<Shared> = slot.owner.as_futex();
+
+        let producer = self.head.select_producer(self.side);
+        let producer: &Futex<Shared> = producer.as_futex();
+        // First, requeue any waiters that assume we're leaving any second.
+        let _n_waiters_moved = slot
+            .cmp_requeue(self.identity.to_slot_id(), 0, producer, i32::MAX)
+            .expect("Slot owner modified but we are the owner");
+
+        producer.wake(i32::MAX) as u32
+    }
+}
+
+impl Drop for OwnedRingSlot {
     fn drop(&mut self) {
         self.info.leave_as_owner_with_futex(self.side, self.head);
     }

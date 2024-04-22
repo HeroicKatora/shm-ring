@@ -4,6 +4,7 @@ use user_ring::frame::Shared;
 use user_ring::server::{RingConfig, RingVersion, ServerConfig};
 
 use memmap2::MmapRaw;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -49,9 +50,15 @@ fn create_server() {
         tid,
     });
 
-    std::thread::spawn(|| {
+    let handle = std::thread::spawn(|| {
         let rhs = join_rhs.unwrap();
+        rhs.wait(Duration::from_millis(1_000));
     });
+
+    let lhs = join_lhs.unwrap();
+    while lhs.wake() == 0 {}
+
+    handle.join().expect("Successfully waited");
 
     let _ = { server };
 }
