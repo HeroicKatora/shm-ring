@@ -106,7 +106,25 @@ pub struct RingInfo {
 pub struct RingHead {
     pub lhs: RingHeadHalf,
     pub rhs: RingHeadHalf,
+    /// Describes one side that is blocked on data produced by the other.
+    ///
+    /// At most one side can be blocked at the same time. Can be pulled low to signal the end of
+    /// the stream, where neither side must be blocked on data.
+    ///
+    /// While active, this is also a Priority-Inversion futex.
+    pub blocked: RingBlockedSlot,
+    pub _padding0: NoAccess<UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>>,
 }
+
+const _: () = {
+    assert!(
+        core::mem::size_of::<RingHead>() <= 4096,
+        "Gotta fix code that assumes this rounds up to a single page."
+    );
+};
+
+#[repr(transparent)]
+pub struct RingBlockedSlot(pub(crate) AtomicU32);
 
 #[repr(C)]
 pub struct RingHeadHalf {
@@ -114,6 +132,16 @@ pub struct RingHeadHalf {
     pub _padding0: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
     pub consumer: AtomicU32,
     pub _padding1: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
+    /// A flag, signalling whether the producer is currently active.
+    ///
+    /// One can futex-wait on this to wait for resumption. Note that this is not the same as
+    /// waiting on `blocked`, which signals a situation where progress can happen _exclusively_ by
+    /// further messages. Indeed, both sides can disable their flags and wait for each other's
+    /// message. The assumption for using this is that a side's activity might depend on some
+    /// third-party resource (such as a network socket) and this is merely a courtesy to signal a
+    /// situation where that resource is temporarily unavailable.
+    pub activation: AtomicU32,
+    pub _padding2: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
 }
 
 /// Wraps memory, not allowing *any* access.
@@ -161,6 +189,15 @@ impl<'lt> IntoIterator for &'lt Rings {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
+    }
+}
+
+impl ClientSide {
+    pub(crate) fn as_block_slot(self) -> u32 {
+        match self {
+            ClientSide::Left => 1,
+            ClientSide::Right => 2,
+        }
     }
 }
 

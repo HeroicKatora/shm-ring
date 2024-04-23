@@ -52,10 +52,13 @@ fn create_server() {
 
     let handle = std::thread::spawn(|| {
         let rhs = join_rhs.unwrap();
-        rhs.wait(Duration::from_millis(1_000));
+        // This unlock spuriously whenever the other side notifies us to check for new messages via
+        // `wake`. While locked, they can check via a relaxed load whether the lock is taken.
+        rhs.block_on_message(Duration::from_millis(1_000));
     });
 
     let lhs = join_lhs.unwrap();
+    // yes we spin-loop to unlock here, as we don't really expect to produce messages.
     while lhs.wake() == 0 {}
 
     handle.join().expect("Successfully waited");

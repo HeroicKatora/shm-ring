@@ -59,7 +59,7 @@ struct OwnedRingSlot {
 
 struct RingMap {
     head: &'static data::ShmHead,
-    slot: OwnedRingSlot,
+    ring_slot: OwnedRingSlot,
 }
 
 impl Client {
@@ -153,7 +153,7 @@ impl Client {
 
         let frame = RingMap {
             head: self.head.head,
-            slot: owned_ring,
+            ring_slot: owned_ring,
         };
 
         Ok(Ring {
@@ -178,7 +178,7 @@ impl Ring {
     /// was successfully completed by a `wake`. Returns `false` if the other half already left the
     /// ring, leaves the ring normally while waiting, is reaped by the authority, or a timeout
     /// occurs.
-    pub fn wait(&self, timeout: time::Duration) -> bool {
+    pub fn block_on_message(&self, timeout: time::Duration) -> bool {
         // Does a bit of a weird dance.. We wait on the _slot_ and not the head counter. The reason
         // here is that it is the _slot_ which must stay constant primarily as one must only wait
         // while there is an active PID on the other side. We rely on the other side to requeue us
@@ -197,35 +197,63 @@ impl Ring {
         // blocked heads, do a `FUTEX_WAKE_OP` on the producer, with the cached previously loaded
         // value, to wake our futexes blocked on the slot when the producer changed to simulate
         // parts of the effect of having checked two values.
-        let other = self.map.slot.info.select_slot(!self.map.slot.side);
-        let owner = other.owner.load(atomic::Ordering::Relaxed);
+        let block = &self.map.ring_slot.head.blocked.0;
+        let owner = self.map.ring_slot.side.as_block_slot();
+
+        let prior = block.compare_exchange_weak(
+            0,
+            owner,
+            atomic::Ordering::Relaxed,
+            atomic::Ordering::Relaxed,
+        );
 
         // Do not wait if there is no other side anymore (or yet)..
-        if (owner as i32) <= 0 {
-            return false;
+        match prior {
+            Ok(_) => {}
+            // FIXME: return an error indicating we're shutting down, other side blocked indefinitely.
+            Err(prior) if prior as i32 <= 0 => return false,
+            // FIXME: return a different error, already blocked.
+            Err(_prior) => return false,
         }
 
-        let slot: &Futex<Shared> = other.owner.as_futex();
+        let slot: &Futex<Shared> = block.as_futex();
+        // FIXME: a dedicated slot might be better. Let each of the sides declare their intention
+        // on whether messages are coming or blocked. And also have at most one side wait on actual
+        // messages. Note that such state can be de-initialized just the same during leaving (and
+        // also even unblocked by the authority while the slot is empty).
+        //
+        // This is going to be interesting as we need 3 (or at least two) checks.
         slot.wait_for(owner, timeout).is_ok()
     }
 
     pub fn wake(&self) -> u32 {
-        self.map.slot.wake()
+        self.map.ring_slot.wake()
     }
 }
 
 impl OwnedRingSlot {
     pub fn wake(&self) -> u32 {
         // See `Ring::wait` for an explanation of this dance.
-        let slot = self.info.select_slot(self.side);
-        let slot: &Futex<Shared> = slot.owner.as_futex();
+        let slot = &self.head.blocked.0;
+        let slot: &Futex<Shared> = slot.as_futex();
 
         let producer = self.head.select_producer(self.side);
         let producer: &Futex<Shared> = producer.as_futex();
         // First, requeue any waiters that assume we're leaving any second.
-        let _n_waiters_moved = slot
-            .cmp_requeue(self.identity.to_slot_id(), 0, producer, i32::MAX)
-            .expect("Slot owner modified but we are the owner");
+        //
+        // FIXME: it's not entirely clear why we re-queue all waiters to that if we know the
+        // comparison to succeed. We could _merge_ different waiters with this strategy but
+        // currently no waiter is taking only the producer futex. In particular, some might wait on
+        // a side beginning to produce again (see: fixme in `wait`) while others are signalling
+        // when our side is blocked on incoming messages (which is an exclusive condition that only
+        // one side must take at a time and which can be stolen when the whole ring is going to be
+        // shut down).
+        let owner = (!self.side).as_block_slot();
+        let Ok(_n_waiters_moved) = slot.cmp_requeue(owner, 0, producer, i32::MAX) else {
+            // Oh, the lock wasn't actually taken. Obviously if we'd have taken the lock then we
+            // wouldn't be running in this. Right?
+            return 0;
+        };
 
         producer.wake(i32::MAX) as u32
     }
