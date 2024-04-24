@@ -2,7 +2,7 @@ use core::{alloc, mem, ptr, sync::atomic, time};
 
 use linux_futex::{AsFutex, Futex, Shared};
 
-use crate::{data, frame};
+use crate::{data, frame, uapi};
 
 pub struct Client {
     ring: frame::Shared,
@@ -39,6 +39,19 @@ pub enum RingJoinError {
     BadRingOffsetRing,
     Unsupported,
     Taken(data::ClientIdentifier),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub enum WaitResult {
+    Ok,
+    PreconditionFailed,
+    RemoteBlocked,
+    RemoteInactive,
+    Error,
+    /// Indetermined, woken up by spurious result.
+    Restart,
+    Timeout,
 }
 
 #[derive(Clone, Copy)]
@@ -178,7 +191,7 @@ impl Ring {
     /// was successfully completed by a `wake`. Returns `false` if the other half already left the
     /// ring, leaves the ring normally while waiting, is reaped by the authority, or a timeout
     /// occurs.
-    pub fn block_on_message(&self, timeout: time::Duration) -> bool {
+    pub fn lock_for_message(&self, timeout: time::Duration) -> WaitResult {
         // Does a bit of a weird dance.. We wait on the _slot_ and not the head counter. The reason
         // here is that it is the _slot_ which must stay constant primarily as one must only wait
         // while there is an active PID on the other side. We rely on the other side to requeue us
@@ -200,6 +213,19 @@ impl Ring {
         let block = &self.map.ring_slot.head.blocked.0;
         let owner = self.map.ring_slot.side.as_block_slot();
 
+        struct Deassert<'lt>(&'lt atomic::AtomicU32, u32);
+
+        impl Drop for Deassert<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.compare_exchange_weak(
+                    self.1,
+                    0,
+                    atomic::Ordering::Relaxed,
+                    atomic::Ordering::Relaxed,
+                );
+            }
+        }
+
         let prior = block.compare_exchange_weak(
             0,
             owner,
@@ -208,13 +234,13 @@ impl Ring {
         );
 
         // Do not wait if there is no other side anymore (or yet)..
-        match prior {
-            Ok(_) => {}
+        let _guard = match prior {
+            Ok(_) => Deassert(block, owner),
             // FIXME: return an error indicating we're shutting down, other side blocked indefinitely.
-            Err(prior) if prior as i32 <= 0 => return false,
+            Err(prior) if prior as i32 <= 0 => return WaitResult::Error,
             // FIXME: return a different error, already blocked.
-            Err(_prior) => return false,
-        }
+            Err(_prior) => return WaitResult::Error,
+        };
 
         let slot: &Futex<Shared> = block.as_futex();
         // FIXME: a dedicated slot might be better. Let each of the sides declare their intention
@@ -223,7 +249,91 @@ impl Ring {
         // also even unblocked by the authority while the slot is empty).
         //
         // This is going to be interesting as we need 3 (or at least two) checks.
-        slot.wait_for(owner, timeout).is_ok()
+        match slot.wait_for(owner, timeout) {
+            Ok(()) => WaitResult::Ok,
+            Err(linux_futex::TimedWaitError::WrongValue) => WaitResult::Error,
+            Err(linux_futex::TimedWaitError::Interrupted) => WaitResult::Restart,
+            Err(linux_futex::TimedWaitError::TimedOut) => WaitResult::Timeout,
+        }
+    }
+
+    pub fn activate(&self) -> i32 {
+        let indicator = self.map.local_indicator();
+        indicator.store(1, atomic::Ordering::Relaxed);
+        let slot: &Futex<Shared> = indicator.as_futex();
+        slot.wake(i32::MAX)
+    }
+
+    pub fn active_remote(&self) -> bool {
+        let indicator = self.map.remote_indicator();
+        indicator.load(atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Wait until the remote signals readiness
+    pub fn wait_for_remote(&self, timeout: time::Duration) -> WaitResult {
+        let mut wakes = [(); 2].map(|_| uapi::FutexWaitv::pending());
+        let [fblock, fsend] = &mut wakes;
+
+        let blocking = &self.map.ring_slot.head.blocked.0;
+        let loaded = blocking.load(atomic::Ordering::Relaxed);
+        *fblock = uapi::FutexWaitv::from_u32(blocking, loaded);
+
+        // Line is going down.
+        if (loaded as i32) < 0 {
+            return WaitResult::RemoteBlocked;
+        }
+
+        let indicator = self.map.remote_indicator();
+        *fsend = uapi::FutexWaitv::from_u32(indicator, 0);
+
+        match uapi::futex_waitv(&mut wakes, timeout) {
+            0 => WaitResult::Restart,
+            1 => WaitResult::Ok,
+            uapi::FutexWaitv::EAGAIN => WaitResult::PreconditionFailed,
+            uapi::FutexWaitv::ETIMEDOUT => WaitResult::Timeout,
+            uapi::FutexWaitv::ERESTARTSYS => WaitResult::Restart,
+            _x => {
+                ::uapi::write(1, ::alloc::format!("{_x}").as_bytes());
+                WaitResult::Error
+            }
+        }
+    }
+
+    /// Wait, until a message arrives or a timeout.
+    ///
+    /// The caller provides their expected producer head's sequence number. This call wakes (or
+    /// refuses to suspend) if any of the following occurs:
+    ///
+    /// - Ownership of the blocking indicator is acquired. It's absurd to wait for data if none
+    ///   will be coming.
+    /// - The other side of the link has de-asserted its sending indicator.
+    /// - The head of the list is changed, with the other side waking waiters.
+    /// - The timeout is reached.
+    pub fn wait_for_message(&self, head: u32, timeout: time::Duration) -> WaitResult {
+        let mut wakes = [(); 3].map(|_| uapi::FutexWaitv::pending());
+        let [fblock, fsend, fhead] = &mut wakes;
+
+        let blocking = &self.map.ring_slot.head.blocked.0;
+        *fblock = uapi::FutexWaitv::from_u32(blocking, 0);
+
+        let indicator = self.map.remote_indicator();
+        *fsend = uapi::FutexWaitv::from_u32(indicator, 1);
+
+        let producer = self.map.remote_producer();
+        *fhead = uapi::FutexWaitv::from_u32(producer, head);
+
+        match uapi::futex_waitv(&mut wakes, timeout) {
+            0 => WaitResult::RemoteBlocked,
+            1 => WaitResult::RemoteInactive,
+            2 => WaitResult::Ok,
+            uapi::FutexWaitv::EAGAIN => WaitResult::PreconditionFailed,
+            uapi::FutexWaitv::ETIMEDOUT => WaitResult::Timeout,
+            uapi::FutexWaitv::ERESTARTSYS => WaitResult::Restart,
+            _x => {
+                ::uapi::write(1, ::alloc::format!("{_x}").as_bytes());
+                WaitResult::Error
+            }
+        }
     }
 
     pub fn wake(&self) -> u32 {
@@ -256,6 +366,24 @@ impl OwnedRingSlot {
         };
 
         producer.wake(i32::MAX) as u32
+    }
+}
+
+impl RingMap {
+    fn local_producer(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.select_producer(self.ring_slot.side)
+    }
+
+    fn remote_producer(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.select_producer(!self.ring_slot.side)
+    }
+
+    fn local_indicator(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.send_indicator(self.ring_slot.side)
+    }
+
+    fn remote_indicator(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.send_indicator(!self.ring_slot.side)
     }
 }
 

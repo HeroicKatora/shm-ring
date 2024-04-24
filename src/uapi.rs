@@ -1,5 +1,5 @@
 use crate::data;
-use core::sync::atomic;
+use core::{marker::PhantomData, sync::atomic, time::Duration};
 
 type ClientIdInt = u64;
 
@@ -42,26 +42,62 @@ impl data::ClientIdentifier {
 }
 
 #[repr(C)]
-pub struct FutexWaitv {
+pub struct FutexWaitv<'lt> {
     /// Linux is prepared for support for 64-bit futexes. Only use 32-bit.
     pub val: u64,
     pub addr: u64,
+    _addr_owner: PhantomData<&'lt atomic::AtomicU32>,
     pub flags: u32,
     __reserved: u32,
 }
 
+unsafe fn _sys_futex_waitv(
+    waiters: *mut FutexWaitv,
+    nr: uapi::c::c_int,
+    flags: uapi::c::c_int,
+    timeout: Option<&mut uapi::c::timespec>,
+    clock_source: uapi::c::clockid_t,
+) -> i64 {
+    uapi::c::syscall(
+        uapi::c::SYS_futex_waitv,
+        waiters,
+        nr,
+        flags,
+        timeout,
+        clock_source,
+    )
+}
+
 #[cfg(feature = "uapi")]
-pub fn futex_waitv(waiters: &[FutexWaitv]) {}
+pub fn futex_waitv(waiters: &mut [FutexWaitv], timeout: Duration) -> i64 {
+    let nr = waiters.len().try_into().unwrap_or(uapi::c::c_int::MAX);
+
+    let mut timespec = uapi::c::timespec {
+        tv_nsec: timeout.subsec_nanos().into(),
+        tv_sec: timeout.as_secs() as uapi::c::time_t,
+    };
+
+    unsafe {
+        _sys_futex_waitv(
+            waiters as *mut _ as *mut _,
+            nr,
+            0,
+            Some(&mut timespec),
+            uapi::c::CLOCK_MONOTONIC,
+        )
+    }
+}
 
 static __HIDDEN: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
-impl FutexWaitv {
+impl FutexWaitv<'static> {
     /// A futex waiter that always wakes immediately (with EAGAIN).
     pub fn ready() -> Self {
         FutexWaitv {
             val: 1,
             addr: &__HIDDEN as *const _ as u64,
-            flags: 0x02,
+            _addr_owner: PhantomData,
+            flags: FutexWaitv::ATOMIC_U32,
             __reserved: 0,
         }
     }
@@ -71,20 +107,28 @@ impl FutexWaitv {
         FutexWaitv {
             val: 0,
             addr: &__HIDDEN as *const _ as u64,
-            flags: 0x02,
-            __reserved: 0,
-        }
-    }
-
-    pub fn from_u32(atomic: &atomic::AtomicU32, val: u32) -> Self {
-        FutexWaitv {
-            // Pad to 64-bit
-            val: val.into(),
-            addr: &atomic as *const _ as u64,
-            flags: 0x02,
+            _addr_owner: PhantomData,
+            flags: FutexWaitv::ATOMIC_U32,
             __reserved: 0,
         }
     }
 
     pub const ATOMIC_U32: u32 = 0x02;
+
+    pub const EAGAIN: i64 = -::uapi::c::EAGAIN as i64;
+    pub const ETIMEDOUT: i64 = -::uapi::c::ETIMEDOUT as i64;
+    pub const ERESTARTSYS: i64 = -::uapi::c::ERESTART as i64;
+}
+
+impl<'word> FutexWaitv<'word> {
+    pub fn from_u32(atomic: &'word atomic::AtomicU32, val: u32) -> Self {
+        FutexWaitv {
+            // Pad to 64-bit
+            val: val.into(),
+            addr: &atomic as *const _ as u64,
+            _addr_owner: PhantomData,
+            flags: FutexWaitv::ATOMIC_U32,
+            __reserved: 0,
+        }
+    }
 }

@@ -140,7 +140,11 @@ pub struct RingHeadHalf {
     /// message. The assumption for using this is that a side's activity might depend on some
     /// third-party resource (such as a network socket) and this is merely a courtesy to signal a
     /// situation where that resource is temporarily unavailable.
-    pub activation: AtomicU32,
+    ///
+    /// This is pulled up to `1` when a send may be occurring, and pulled down to `0` when sending
+    /// is deactivate momentarily. (Note this is separate from `RingHead::blocked`'s attribute).
+    /// Each transition should wake any futex blocked on the value.
+    pub send_indicator: AtomicU32,
     pub _padding2: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
 }
 
@@ -311,6 +315,20 @@ impl RingHead {
         match side {
             ClientSide::Left => &self.lhs.producer,
             ClientSide::Right => &self.rhs.producer,
+        }
+    }
+
+    pub fn select_consumer(&self, side: ClientSide) -> &AtomicU32 {
+        match side {
+            ClientSide::Left => &self.lhs.consumer,
+            ClientSide::Right => &self.rhs.consumer,
+        }
+    }
+
+    pub fn send_indicator(&self, side: ClientSide) -> &AtomicU32 {
+        match side {
+            ClientSide::Left => &self.lhs.send_indicator,
+            ClientSide::Right => &self.rhs.send_indicator,
         }
     }
 }

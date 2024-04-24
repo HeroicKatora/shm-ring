@@ -1,4 +1,4 @@
-use user_ring::client::RingRequest;
+use user_ring::client::{RingRequest, WaitResult};
 use user_ring::data::{ClientIdentifier, ClientSide, RingIndex};
 use user_ring::frame::Shared;
 use user_ring::server::{RingConfig, RingVersion, ServerConfig};
@@ -52,14 +52,34 @@ fn create_server() {
 
     let handle = std::thread::spawn(|| {
         let rhs = join_rhs.unwrap();
+
         // This unlock spuriously whenever the other side notifies us to check for new messages via
         // `wake`. While locked, they can check via a relaxed load whether the lock is taken.
-        rhs.block_on_message(Duration::from_millis(1_000));
+        assert_eq!(
+            rhs.lock_for_message(Duration::from_millis(1_000)),
+            WaitResult::Ok
+        );
     });
 
     let lhs = join_lhs.unwrap();
+
+    // Does not correspond to our initial assumptions (still inactive), so this must fail.
+    assert_eq!(
+        lhs.wait_for_message(0, Duration::from_millis(0)),
+        WaitResult::PreconditionFailed
+    );
+
     // yes we spin-loop to unlock here, as we don't really expect to produce messages.
     while lhs.wake() == 0 {}
+
+    while {
+        assert_eq!(
+            lhs.wait_for_remote(Duration::from_millis(1_000)),
+            WaitResult::Ok
+        );
+
+        !lhs.active_remote()
+    } {}
 
     handle.join().expect("Successfully waited");
 
