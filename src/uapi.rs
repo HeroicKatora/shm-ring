@@ -1,4 +1,5 @@
 use crate::data;
+use core::sync::atomic;
 
 type ClientIdInt = u64;
 
@@ -38,4 +39,52 @@ impl data::ClientIdentifier {
     pub(crate) fn open_pid(self) -> Result<OwnedFd, uapi::Errno> {
         uapi::pidfd_open(self.pid(), uapi::c::PIDFD_NONBLOCK).map(OwnedFd)
     }
+}
+
+#[repr(C)]
+pub struct FutexWaitv {
+    /// Linux is prepared for support for 64-bit futexes. Only use 32-bit.
+    pub val: u64,
+    pub addr: u64,
+    pub flags: u32,
+    __reserved: u32,
+}
+
+#[cfg(feature = "uapi")]
+pub fn futex_waitv(waiters: &[FutexWaitv]) {}
+
+static __HIDDEN: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+impl FutexWaitv {
+    /// A futex waiter that always wakes immediately (with EAGAIN).
+    pub fn ready() -> Self {
+        FutexWaitv {
+            val: 1,
+            addr: &__HIDDEN as *const _ as u64,
+            flags: 0x02,
+            __reserved: 0,
+        }
+    }
+
+    /// A futex that never resolves.
+    pub fn pending() -> Self {
+        FutexWaitv {
+            val: 0,
+            addr: &__HIDDEN as *const _ as u64,
+            flags: 0x02,
+            __reserved: 0,
+        }
+    }
+
+    pub fn from_u32(atomic: &atomic::AtomicU32, val: u32) -> Self {
+        FutexWaitv {
+            // Pad to 64-bit
+            val: val.into(),
+            addr: &atomic as *const _ as u64,
+            flags: 0x02,
+            __reserved: 0,
+        }
+    }
+
+    pub const ATOMIC_U32: u32 = 0x02;
 }
