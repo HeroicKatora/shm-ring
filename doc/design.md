@@ -32,4 +32,14 @@ have processes register a resource list of futexes, which the kernel will reap
 together with file descriptors to mitigate this, but it's not clear what will
 be necessary and how the interface will look like).
 
-  TODO: Looking into `FUTEX_WAKE_OP` to modify the head state.
+Still, in many cases the new `futex_waitv` system call provides a partial
+solution. We can now wait for all of the different 'blocked' and 'update'
+notification at the same time, reacting to the first of them. With io-uring
+this can be improved even further since it allows submitting the wait calls
+without blocking the current thread (and by that, the thread in-control of the
+ring resource). This way we might even run competing waits in parallel to each
+other.
+
+  TODO: `FUTEX_WAKE_OP` to modify the head state is pretty interesting? Is it
+  ever possible and necessary for a pure write (not cmpxchg) to be atomic with
+  regards to other futexes?

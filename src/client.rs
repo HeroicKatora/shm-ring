@@ -242,6 +242,11 @@ impl Ring {
             Err(_prior) => return WaitResult::Error,
         };
 
+        // FIXME: we could turn this into a guard here, returning to the caller. We hold the lock
+        // now, and need not immediately wait. However, the guard could be 'stolen' or more
+        // precisely locked-up into the invalid state. Then we still own the lock but no longer
+        // return it to an unlocked state.
+
         let slot: &Futex<Shared> = block.as_futex();
         // FIXME: a dedicated slot might be better. Let each of the sides declare their intention
         // on whether messages are coming or blocked. And also have at most one side wait on actual
@@ -264,7 +269,7 @@ impl Ring {
         slot.wake(i32::MAX)
     }
 
-    pub fn active_remote(&self) -> bool {
+    pub fn is_active_remote(&self) -> bool {
         let indicator = self.map.remote_indicator();
         indicator.load(atomic::Ordering::Relaxed) != 0
     }
@@ -287,15 +292,14 @@ impl Ring {
         *fsend = uapi::FutexWaitv::from_u32(indicator, 0);
 
         match uapi::futex_waitv(&mut wakes, timeout) {
-            0 => WaitResult::Restart,
-            1 => WaitResult::Ok,
-            uapi::FutexWaitv::EAGAIN => WaitResult::PreconditionFailed,
-            uapi::FutexWaitv::ETIMEDOUT => WaitResult::Timeout,
-            uapi::FutexWaitv::ERESTARTSYS => WaitResult::Restart,
-            _x => {
-                ::uapi::write(1, ::alloc::format!("{_x}").as_bytes());
-                WaitResult::Error
-            }
+            Ok(0) => WaitResult::Restart,
+            Ok(1) => WaitResult::Ok,
+            Err(uapi::FutexWaitv::EAGAIN) => WaitResult::PreconditionFailed,
+            Err(uapi::FutexWaitv::ETIMEDOUT) => WaitResult::Timeout,
+            Err(uapi::FutexWaitv::ERESTARTSYS) => WaitResult::Restart,
+            // ::uapi::write(1, ::alloc::format!("{other}").as_bytes());
+            // Must not happen, under the kernel-documented error value cases.
+            _x => WaitResult::Error,
         }
     }
 
@@ -323,16 +327,14 @@ impl Ring {
         *fhead = uapi::FutexWaitv::from_u32(producer, head);
 
         match uapi::futex_waitv(&mut wakes, timeout) {
-            0 => WaitResult::RemoteBlocked,
-            1 => WaitResult::RemoteInactive,
-            2 => WaitResult::Ok,
-            uapi::FutexWaitv::EAGAIN => WaitResult::PreconditionFailed,
-            uapi::FutexWaitv::ETIMEDOUT => WaitResult::Timeout,
-            uapi::FutexWaitv::ERESTARTSYS => WaitResult::Restart,
-            _x => {
-                ::uapi::write(1, ::alloc::format!("{_x}").as_bytes());
-                WaitResult::Error
-            }
+            Ok(0) => WaitResult::RemoteBlocked,
+            Ok(1) => WaitResult::RemoteInactive,
+            Ok(2) => WaitResult::Ok,
+            Err(uapi::FutexWaitv::EAGAIN) => WaitResult::PreconditionFailed,
+            Err(uapi::FutexWaitv::ETIMEDOUT) => WaitResult::Timeout,
+            Err(uapi::FutexWaitv::ERESTARTSYS) => WaitResult::Restart,
+            // Must not happen, under the kernel-documented error value cases.
+            _x => WaitResult::Error,
         }
     }
 

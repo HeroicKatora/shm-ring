@@ -59,6 +59,8 @@ fn create_server() {
             rhs.lock_for_message(Duration::from_millis(1_000)),
             WaitResult::Ok
         );
+
+        assert_eq!(rhs.activate(), 1);
     });
 
     let lhs = join_lhs.unwrap();
@@ -73,12 +75,20 @@ fn create_server() {
     while lhs.wake() == 0 {}
 
     while {
-        assert_eq!(
-            lhs.wait_for_remote(Duration::from_millis(1_000)),
-            WaitResult::Ok
+        let waited = lhs.wait_for_remote(Duration::from_millis(1_000));
+
+        assert!(
+            matches!(
+                waited,
+                // We should expect that a failed precondition is the interception of the toggle by the
+                // remote.
+                WaitResult::Restart | WaitResult::Ok | WaitResult::PreconditionFailed,
+            ),
+            "{:?}",
+            waited
         );
 
-        !lhs.active_remote()
+        !lhs.is_active_remote()
     } {}
 
     handle.join().expect("Successfully waited");

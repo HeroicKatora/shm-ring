@@ -58,6 +58,8 @@ unsafe fn _sys_futex_waitv(
     timeout: Option<&mut uapi::c::timespec>,
     clock_source: uapi::c::clockid_t,
 ) -> i64 {
+    *uapi::c::__errno_location() = 0;
+
     uapi::c::syscall(
         uapi::c::SYS_futex_waitv,
         waiters,
@@ -69,7 +71,7 @@ unsafe fn _sys_futex_waitv(
 }
 
 #[cfg(feature = "uapi")]
-pub fn futex_waitv(waiters: &mut [FutexWaitv], timeout: Duration) -> i64 {
+pub fn futex_waitv(waiters: &mut [FutexWaitv], timeout: Duration) -> Result<i64, i32> {
     let nr = waiters.len().try_into().unwrap_or(uapi::c::c_int::MAX);
 
     let mut timespec = uapi::c::timespec {
@@ -77,7 +79,12 @@ pub fn futex_waitv(waiters: &mut [FutexWaitv], timeout: Duration) -> i64 {
         tv_sec: timeout.as_secs() as uapi::c::time_t,
     };
 
-    unsafe {
+    uapi::clock_gettime(uapi::c::CLOCK_MONOTONIC, &mut timespec).map_err(|i| i.0)?;
+
+    timespec.tv_nsec += timeout.subsec_nanos() as i64;
+    timespec.tv_sec += timeout.as_secs() as uapi::c::time_t;
+
+    let err = unsafe {
         _sys_futex_waitv(
             waiters as *mut _ as *mut _,
             nr,
@@ -85,6 +92,12 @@ pub fn futex_waitv(waiters: &mut [FutexWaitv], timeout: Duration) -> i64 {
             Some(&mut timespec),
             uapi::c::CLOCK_MONOTONIC,
         )
+    };
+
+    if err < 0 {
+        Err(unsafe { *uapi::errno_location() })
+    } else {
+        Ok(err)
     }
 }
 
@@ -115,9 +128,9 @@ impl FutexWaitv<'static> {
 
     pub const ATOMIC_U32: u32 = 0x02;
 
-    pub const EAGAIN: i64 = -::uapi::c::EAGAIN as i64;
-    pub const ETIMEDOUT: i64 = -::uapi::c::ETIMEDOUT as i64;
-    pub const ERESTARTSYS: i64 = -::uapi::c::ERESTART as i64;
+    pub const EAGAIN: i32 = ::uapi::c::EAGAIN;
+    pub const ETIMEDOUT: i32 = ::uapi::c::ETIMEDOUT;
+    pub const ERESTARTSYS: i32 = ::uapi::c::ERESTART;
 }
 
 impl<'word> FutexWaitv<'word> {
@@ -125,7 +138,7 @@ impl<'word> FutexWaitv<'word> {
         FutexWaitv {
             // Pad to 64-bit
             val: val.into(),
-            addr: &atomic as *const _ as u64,
+            addr: atomic as *const _ as u64,
             _addr_owner: PhantomData,
             flags: FutexWaitv::ATOMIC_U32,
             __reserved: 0,
