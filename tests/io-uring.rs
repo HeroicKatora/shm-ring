@@ -53,18 +53,28 @@ async fn sync_rings() {
 
     let ring = ShmIoUring::new(&shared).unwrap();
 
-    tokio::join!(
+    let (locked, woken) = tokio::join!(
         ring.lock_for_message(&rhs, Duration::from_millis(1_000)),
         async {
             loop {
                 match ring.wake(&lhs).await {
                     Err(e) => break Err(e),
                     Ok(0) => {}
-                    Ok(_) => break Ok(()),
+                    Ok(n) => break Ok(n),
                 }
             }
         }
     );
+
+    assert!(matches!(
+        locked.expect("IO-Uring successful"),
+        WaitResult::Ok,
+    ));
+
+    assert!(matches!(
+        woken.expect("IO-Uring successful"),
+        1
+    ));
 
     tokio::join!(ring.activate(&rhs), async {
         loop {

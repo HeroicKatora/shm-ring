@@ -147,7 +147,7 @@ impl ShmIoUring {
         *fblock = unsafe { FutexWaitv::from_u32_unchecked(assertion.block(), assertion.owner()) };
 
         let key = self.establish_notice();
-        let entry = opcode::FutexWaitV::new(&wakes as *const _ as *const _, 1)
+        let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 1)
             .build()
             .user_data(key.as_user_data())
             .flags(io_uring::squeue::Flags::IO_LINK);
@@ -159,7 +159,7 @@ impl ShmIoUring {
 
         // Safety: the reference-counted pointers of wakes and timespec are passed. The entries
         // submitted are also otherwise valid.
-        let entry_to = opcode::Timeout::new(&timespec as *const _ as *const _).build();
+        let entry_to = opcode::Timeout::new(Rc::as_ptr(&timespec) as *const _).build();
         unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec]) };
 
         Ok(match key.wait().await {
@@ -197,7 +197,7 @@ impl ShmIoUring {
         *fhead = unsafe { FutexWaitv::from_u32_unchecked(producer, head) };
 
         let key = self.establish_notice();
-        let entry = opcode::FutexWaitV::new(&wakes as *const _ as *const _, 3)
+        let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 3)
             .build()
             .user_data(key.as_user_data())
             .flags(io_uring::squeue::Flags::IO_LINK);
@@ -209,7 +209,7 @@ impl ShmIoUring {
 
         // Safety: the reference-counted pointers of wakes and timespec are passed. The entries
         // submitted are also otherwise valid.
-        let entry_to = opcode::Timeout::new(&timespec as *const _ as *const _).build();
+        let entry_to = opcode::Timeout::new(Rc::as_ptr(&timespec) as *const _).build();
         unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec]) };
 
         match key.wait().await {
@@ -233,15 +233,29 @@ impl ShmIoUring {
 
         let key = self.establish_notice();
         let producer = head.select_producer(side).as_ptr();
-        let entry_head = opcode::FutexWake::new(producer, u64::MAX, u32::MAX.into(), 0)
-            .build()
-            .user_data(key.as_user_data());
+        let entry_head = opcode::FutexWake::new(
+            producer,
+            // Wakeup everyone.
+            u32::MAX.into(),
+            u32::MAX.into(),
+            // On this 32-bit futex.
+            FutexWaitv::ATOMIC_U32,
+        )
+        .build()
+        .user_data(key.as_user_data());
 
         let key = self.establish_notice();
         let producer = head.blocked.0.as_ptr();
-        let entry_blocked = opcode::FutexWake::new(producer, u64::MAX, u32::MAX.into(), 0)
-            .build()
-            .user_data(key.as_user_data());
+        let entry_blocked = opcode::FutexWake::new(
+            producer,
+            // Wakeup everyone.
+            u32::MAX.into(),
+            u32::MAX.into(),
+            // On this 32-bit futex.
+            FutexWaitv::ATOMIC_U32,
+        )
+        .build()
+        .user_data(key.as_user_data());
 
         // Safety: no reference-counted pointers are needed.
         unsafe { submit.redeem_push(&[entry_head, entry_blocked], []) };
@@ -359,12 +373,12 @@ impl KeyOwner<'_> {
             }
         };
 
-        // eprintln!("Ready {}", self.as_user_data());
         permit.unwrap().forget();
         let n = self.2.available_permits();
 
         // Signalled via here, and the kernel signals error with negative values.
         let kernel_result = (n as u32) as i32;
+        // eprintln!("Ready {} {}", self.as_user_data(), kernel_result);
         if kernel_result >= 0 {
             Ok(kernel_result as i64)
         } else {
