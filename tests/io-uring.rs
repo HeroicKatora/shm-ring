@@ -71,12 +71,13 @@ async fn sync_rings() {
         WaitResult::Ok,
     ));
 
-    assert!(matches!(
-        woken.expect("IO-Uring successful"),
-        1
-    ));
+    assert!(matches!(woken.expect("IO-Uring successful"), 1));
 
-    tokio::join!(ring.activate(&rhs), async {
+    let hdl = tokio::task::spawn_blocking(move || {
+        rhs.activate();
+    });
+
+    let (joiner, active) = tokio::join!(hdl, async {
         loop {
             let waited = ring
                 .wait_for_remote(&lhs, Duration::from_millis(1_000))
@@ -98,9 +99,12 @@ async fn sync_rings() {
                 waited
             );
 
-            if !lhs.is_active_remote() {
+            if lhs.is_active_remote() {
                 break Ok(());
             }
         }
     });
+
+    joiner.expect("Activation successful");
+    let () = active.expect("IO-Uring successful");
 }

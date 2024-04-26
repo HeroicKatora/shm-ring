@@ -106,13 +106,9 @@ impl ShmIoUring {
         })
     }
 
-    pub async fn activate(&self, ring: &Ring) -> Result<i32, std::io::Error> {
-        // Required for soundness.
-        assert!(self.shared_user_ring.owns_ring(ring));
-        self.non_empty_submission_and_then_sync(1).await?;
-        let key = self.establish_notice();
-        todo!()
-    }
+    // We do not implement `activate` here, which is a single futex wake call, since semantics of
+    // dropping it in progress are not entirely fruitful. Sure, one can just restart that sequence
+    // despite already being active but what.
 
     pub async fn wait_for_remote(
         &self,
@@ -121,8 +117,50 @@ impl ShmIoUring {
     ) -> Result<WaitResult, std::io::Error> {
         assert!(self.shared_user_ring.owns_ring(ring));
 
+        let head = ring.ring_head();
+        let blocking = &head.blocked.0;
+        let loaded = blocking.load(core::sync::atomic::Ordering::Relaxed);
+
+        // Line is going down.
+        if (loaded as i32) < 0 {
+            return Ok(WaitResult::RemoteBlocked);
+        }
+
+        let submit = self.non_empty_submission_and_then_sync(2).await?;
+
+        let mut wakes = Rc::new([(); 2].map(|_| FutexWaitv::pending()));
+        let [fblock, fsend] = Rc::get_mut(&mut wakes).unwrap();
+
+        *fblock = unsafe { FutexWaitv::from_u32_unchecked(blocking, loaded) };
+        let indicator = head.send_indicator(!ring.side());
+        *fsend = unsafe { FutexWaitv::from_u32_unchecked(indicator, 0) };
+
+        let key = self.establish_notice();
+        let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 2)
+            .build()
+            .user_data(key.as_user_data())
+            .flags(io_uring::squeue::Flags::IO_LINK);
+
+        let timespec = Rc::new(uapi::c::timespec {
+            tv_nsec: timeout.subsec_nanos().into(),
+            tv_sec: timeout.as_secs() as uapi::c::time_t,
+        });
+
+        // Safety: the reference-counted pointers of wakes and timespec are passed. The entries
+        // submitted are also otherwise valid.
+        let entry_to = opcode::Timeout::new(Rc::as_ptr(&timespec) as *const _).build();
+        unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec]) };
+
         // assertion.
-        todo!()
+        Ok(match key.wait().await {
+            Ok(0) => WaitResult::Restart,
+            Ok(1) => WaitResult::Ok,
+            Err(FutexWaitv::EAGAIN) => WaitResult::PreconditionFailed,
+            Err(FutexWaitv::ETIMEDOUT) => WaitResult::Timeout,
+            Err(FutexWaitv::ERESTARTSYS) => WaitResult::Restart,
+            Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
+            Ok(_) => WaitResult::Error,
+        })
     }
 
     pub async fn lock_for_message(
@@ -341,7 +379,10 @@ impl ShmIoUring {
             let key = DefaultKey::from(data);
             let result: i32 = entry.result();
 
+            // The waiter might already be gone, if the task was cancelled by being dropped.
             if let Some(waiter) = notify.remove(key) {
+                // One permit is consumed by the waiter itself, then the rest encodes the actual result.
+                // FIXME: on 32-bit systems we might corrupt an `-1 == -EPERM`.
                 waiter.add_permits((1 + (result as u32)) as usize);
             }
         }
@@ -352,6 +393,8 @@ impl ShmIoUring {
         stable_timeouts: &cell::RefCell<TimeoutDeque>,
     ) -> std::io::Result<usize> {
         let n = ring.submitter().submit()?;
+        // After submissions, we no longer need to keep alive the referenced data. There is a
+        // one-to-one correspondence between our queue for this and the submitted entries.
         stable_timeouts.borrow_mut().drain(..n).for_each(|_| ());
         Ok(n)
     }
