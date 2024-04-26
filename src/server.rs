@@ -146,6 +146,10 @@ impl Server {
         })
     }
 
+    pub(crate) fn shared_ring(&self) -> &frame::Shared {
+        &self.ring
+    }
+
     fn offsets(
         info: &mut [data::RingInfo],
         cfg: &[RingConfig],

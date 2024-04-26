@@ -41,6 +41,7 @@ impl data::ClientIdentifier {
     }
 }
 
+// FIXME: also useful in IO-uring. So move it out of this uapi feature file?
 #[repr(C)]
 pub struct FutexWaitv<'lt> {
     /// Linux is prepared for support for 64-bit futexes. Only use 32-bit.
@@ -131,6 +132,17 @@ impl FutexWaitv<'static> {
     pub const EAGAIN: i32 = ::uapi::c::EAGAIN;
     pub const ETIMEDOUT: i32 = ::uapi::c::ETIMEDOUT;
     pub const ERESTARTSYS: i32 = ::uapi::c::ERESTART;
+
+    pub unsafe fn from_u32_unchecked(atomic: &'_ atomic::AtomicU32, val: u32) -> Self {
+        FutexWaitv {
+            // Pad to 64-bit
+            val: val.into(),
+            addr: atomic as *const _ as u64,
+            _addr_owner: PhantomData,
+            flags: FutexWaitv::ATOMIC_U32,
+            __reserved: 0,
+        }
+    }
 }
 
 impl<'word> FutexWaitv<'word> {

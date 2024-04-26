@@ -16,6 +16,11 @@ pub struct Ring {
     ring_id: data::RingIdentifier,
 }
 
+pub struct RingAssertion<'lt> {
+    block: &'lt atomic::AtomicU32,
+    owner: u32,
+}
+
 pub struct RingRequest {
     pub index: data::RingIndex,
     pub side: data::ClientSide,
@@ -123,6 +128,10 @@ impl Client {
         Ok(Client { ring, head })
     }
 
+    pub(crate) fn shared_ring(&self) -> &frame::Shared {
+        &self.ring
+    }
+
     pub fn join(&self, req: &RingRequest) -> Result<Ring, RingJoinError> {
         // Protects any copy of `self.frame` we create.
         let ring = self.ring.clone();
@@ -191,7 +200,7 @@ impl Ring {
     /// was successfully completed by a `wake`. Returns `false` if the other half already left the
     /// ring, leaves the ring normally while waiting, is reaped by the authority, or a timeout
     /// occurs.
-    pub fn lock_for_message(&self, timeout: time::Duration) -> WaitResult {
+    pub fn lock_for_message(&self) -> Result<RingAssertion<'_>, WaitResult> {
         // Does a bit of a weird dance.. We wait on the _slot_ and not the head counter. The reason
         // here is that it is the _slot_ which must stay constant primarily as one must only wait
         // while there is an active PID on the other side. We rely on the other side to requeue us
@@ -213,12 +222,10 @@ impl Ring {
         let block = &self.map.ring_slot.head.blocked.0;
         let owner = self.map.ring_slot.side.as_block_slot();
 
-        struct Deassert<'lt>(&'lt atomic::AtomicU32, u32);
-
-        impl Drop for Deassert<'_> {
+        impl Drop for RingAssertion<'_> {
             fn drop(&mut self) {
-                let _ = self.0.compare_exchange_weak(
-                    self.1,
+                let _ = self.block.compare_exchange_weak(
+                    self.owner,
                     0,
                     atomic::Ordering::Relaxed,
                     atomic::Ordering::Relaxed,
@@ -234,31 +241,12 @@ impl Ring {
         );
 
         // Do not wait if there is no other side anymore (or yet)..
-        let _guard = match prior {
-            Ok(_) => Deassert(block, owner),
+        match prior {
+            Ok(_) => Ok(RingAssertion { block, owner }),
             // FIXME: return an error indicating we're shutting down, other side blocked indefinitely.
-            Err(prior) if prior as i32 <= 0 => return WaitResult::Error,
+            Err(prior) if prior as i32 <= 0 => return Err(WaitResult::Error),
             // FIXME: return a different error, already blocked.
-            Err(_prior) => return WaitResult::Error,
-        };
-
-        // FIXME: we could turn this into a guard here, returning to the caller. We hold the lock
-        // now, and need not immediately wait. However, the guard could be 'stolen' or more
-        // precisely locked-up into the invalid state. Then we still own the lock but no longer
-        // return it to an unlocked state.
-
-        let slot: &Futex<Shared> = block.as_futex();
-        // FIXME: a dedicated slot might be better. Let each of the sides declare their intention
-        // on whether messages are coming or blocked. And also have at most one side wait on actual
-        // messages. Note that such state can be de-initialized just the same during leaving (and
-        // also even unblocked by the authority while the slot is empty).
-        //
-        // This is going to be interesting as we need 3 (or at least two) checks.
-        match slot.wait_for(owner, timeout) {
-            Ok(()) => WaitResult::Ok,
-            Err(linux_futex::TimedWaitError::WrongValue) => WaitResult::Error,
-            Err(linux_futex::TimedWaitError::Interrupted) => WaitResult::Restart,
-            Err(linux_futex::TimedWaitError::TimedOut) => WaitResult::Timeout,
+            Err(_prior) => return Err(WaitResult::Error),
         }
     }
 
@@ -272,6 +260,10 @@ impl Ring {
     pub fn is_active_remote(&self) -> bool {
         let indicator = self.map.remote_indicator();
         indicator.load(atomic::Ordering::Relaxed) != 0
+    }
+
+    pub(crate) fn shared_ring(&self) -> &frame::Shared {
+        &self.ring
     }
 
     /// Wait until the remote signals readiness
@@ -341,6 +333,63 @@ impl Ring {
     pub fn wake(&self) -> u32 {
         self.map.ring_slot.wake()
     }
+
+    pub(crate) fn ring_head(&self) -> &data::RingHead {
+        self.map.ring_slot.head
+    }
+
+    pub(crate) fn side(&self) -> data::ClientSide {
+        self.map.ring_slot.side
+    }
+}
+
+impl RingAssertion<'_> {
+    pub fn wake(self, timeout: time::Duration) -> WaitResult {
+        // FIXME: we could turn this into a guard here, returning to the caller. We hold the lock
+        // now, and need not immediately wait. However, the guard could be 'stolen' or more
+        // precisely locked-up into the invalid state. Then we still own the lock but no longer
+        // return it to an unlocked state.
+
+        let slot: &Futex<Shared> = self.block.as_futex();
+        // FIXME: a dedicated slot might be better. Let each of the sides declare their intention
+        // on whether messages are coming or blocked. And also have at most one side wait on actual
+        // messages. Note that such state can be de-initialized just the same during leaving (and
+        // also even unblocked by the authority while the slot is empty).
+        //
+        // This is going to be interesting as we need 3 (or at least two) checks.
+        match slot.wait_for(self.owner, timeout) {
+            Ok(()) => WaitResult::Ok,
+            Err(linux_futex::TimedWaitError::WrongValue) => WaitResult::Error,
+            Err(linux_futex::TimedWaitError::Interrupted) => WaitResult::Restart,
+            Err(linux_futex::TimedWaitError::TimedOut) => WaitResult::Timeout,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> u32 {
+        self.owner
+    }
+
+    pub(crate) fn block(&self) -> &atomic::AtomicU32 {
+        &self.block
+    }
+}
+
+impl RingMap {
+    fn local_producer(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.select_producer(self.ring_slot.side)
+    }
+
+    fn remote_producer(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.select_producer(!self.ring_slot.side)
+    }
+
+    fn local_indicator(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.send_indicator(self.ring_slot.side)
+    }
+
+    fn remote_indicator(&self) -> &atomic::AtomicU32 {
+        self.ring_slot.head.send_indicator(!self.ring_slot.side)
+    }
 }
 
 impl OwnedRingSlot {
@@ -368,24 +417,6 @@ impl OwnedRingSlot {
         };
 
         producer.wake(i32::MAX) as u32
-    }
-}
-
-impl RingMap {
-    fn local_producer(&self) -> &atomic::AtomicU32 {
-        self.ring_slot.head.select_producer(self.ring_slot.side)
-    }
-
-    fn remote_producer(&self) -> &atomic::AtomicU32 {
-        self.ring_slot.head.select_producer(!self.ring_slot.side)
-    }
-
-    fn local_indicator(&self) -> &atomic::AtomicU32 {
-        self.ring_slot.head.send_indicator(self.ring_slot.side)
-    }
-
-    fn remote_indicator(&self) -> &atomic::AtomicU32 {
-        self.ring_slot.head.send_indicator(!self.ring_slot.side)
     }
 }
 

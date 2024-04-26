@@ -52,14 +52,11 @@ fn create_server() {
 
     let handle = std::thread::spawn(|| {
         let rhs = join_rhs.unwrap();
+        let guard = rhs.lock_for_message().expect("Not guarded by rhs");
 
         // This unlock spuriously whenever the other side notifies us to check for new messages via
         // `wake`. While locked, they can check via a relaxed load whether the lock is taken.
-        assert_eq!(
-            rhs.lock_for_message(Duration::from_millis(1_000)),
-            WaitResult::Ok
-        );
-
+        assert_eq!(guard.wake(Duration::from_millis(1_000)), WaitResult::Ok);
         assert_eq!(rhs.activate(), 1);
     });
 
