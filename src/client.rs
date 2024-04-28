@@ -2,7 +2,7 @@ use core::{alloc, mem, ptr, sync::atomic, time};
 
 use linux_futex::{AsFutex, Futex, Shared};
 
-use crate::{data, frame, uapi};
+use crate::{data, frame, ring, uapi};
 
 pub struct Client {
     ring: frame::Shared,
@@ -25,6 +25,25 @@ pub struct RingRequest {
     pub index: data::RingIndex,
     pub side: data::ClientSide,
     pub tid: data::ClientIdentifier,
+}
+
+pub struct RingAttributes {
+    /// The offset at which to find this rings head structure.
+    pub offset_head: data::ShOffset,
+    /// The offset at which to find this rings slot structure.
+    pub offset_ring: data::ShOffset,
+    /// The offset at which to find this rings data structure.
+    pub offset_data: data::ShOffset,
+    /// The byte size of that rings head.
+    pub size_head: u64,
+    /// The byte size of that rings slot structure.
+    pub size_ring: u64,
+    /// The byte size of that rings data structure.
+    pub size_data: u64,
+    /// The byte size of each entry in the rings slot structure.
+    pub size_slot_entry: u64,
+    /// The advertised identifier of the slot, when we joined it.
+    pub ring_id: data::RingIdentifier,
 }
 
 #[derive(Debug)]
@@ -193,6 +212,26 @@ impl Client {
 }
 
 impl Ring {
+    /// Give up the ring, in favor of a potentially different client, without de-initializing.
+    ///
+    /// The ring passes the condition for reaping the ring to that other process.
+    ///
+    /// Careful with this. Naming some long-lived process that does not care to acquire the donated
+    /// ring or is incapable of doing so at the time will leave it blocked.
+    pub fn donate(self, _: data::ClientIdentifier) {
+        todo!()
+    }
+
+    /// Give up this side of the ring, such that another connection to it can be opened.
+    ///
+    /// FIXME: unclear how this is implementable. The ring needs to be brought into a state as if
+    /// we hadn't joined it yet. Our part isn't hard, but ensuring the other side gets there might
+    /// be. (I.e. The other can not block, our producer head must be brought back, the consumer
+    /// head must be synced up, what to do with dropped messages, etc).
+    pub fn relinquish(self) {
+        todo!()
+    }
+
     /// Wait on the other side to move the head and wake us.
     ///
     /// Alternatively, the operation may be woken by the coordination authority if the PID
@@ -260,6 +299,44 @@ impl Ring {
     pub fn is_active_remote(&self) -> bool {
         let indicator = self.map.remote_indicator();
         indicator.load(atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Get the static information about the ring we joined.
+    pub fn info(&self) -> RingAttributes {
+        let info = self.map.ring_slot.info;
+
+        RingAttributes {
+            offset_head: info.offset_head,
+            offset_ring: info.offset_ring,
+            offset_data: info.offset_data,
+            size_head: info.size_head,
+            size_ring: info.size_ring,
+            size_data: info.size_data,
+            size_slot_entry: info.size_slot_entry,
+            ring_id: self.ring_id,
+        }
+    }
+
+    /// Does the dangerous portion of borrowing the (improperly) `&'static` references.
+    ///
+    /// Since we borrow `self` here, the ring itself is ensured to outlive the borrowed map to the
+    /// references whose memory is held alive by the ring.
+    pub(crate) fn borrow_map(&self) -> ring::Map<'_> {
+        ring::Map {
+            info: self.map.ring_slot.info,
+            head: self.map.ring_slot.head,
+            side: self.map.ring_slot.side,
+        }
+    }
+
+    /// Get the producer head for this ring, given its correct size.
+    pub fn producer<const N: usize>(&mut self) -> Option<ring::Producer<'_, N>> {
+        ring::Producer::new(self.borrow_map())
+    }
+
+    /// Get the producer head for this ring, given its correct size.
+    pub fn consumer<const N: usize>(&mut self) -> Option<ring::Consumer<'_, N>> {
+        ring::Consumer::new(self.borrow_map())
     }
 
     pub(crate) fn shared_ring(&self) -> &frame::Shared {

@@ -15,6 +15,7 @@ pub mod data;
 pub mod frame;
 /// Contains all code to interacts with the OS directly.
 mod uapi;
+pub mod ring;
 pub mod server;
 
 #[cfg(feature = "io-uring")]
