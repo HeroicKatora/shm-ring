@@ -17,10 +17,6 @@ pub(crate) struct Map<'ring> {
     pub(crate) ring: &'ring UnsafeCell<[u8]>,
 }
 
-struct Cache {
-    remote_ack: u32,
-}
-
 pub struct Producer<'ring, const N: usize> {
     /// The slot of the local head to indicate how many are filled.
     head: &'ring atomic::AtomicU32,
@@ -28,8 +24,9 @@ pub struct Producer<'ring, const N: usize> {
     tail: &'ring atomic::AtomicU32,
     ring: &'ring [UnsafeCell<[u8; N]>],
     offset_mask: u64,
-    cached_head: u32,
-    cached_tail: u32,
+    count: u64,
+    cached_head: u64,
+    cached_tail: u64,
 }
 
 pub struct Consumer<'ring, const N: usize> {
@@ -39,8 +36,8 @@ pub struct Consumer<'ring, const N: usize> {
     head: &'ring atomic::AtomicU32,
     ring: &'ring [UnsafeCell<[u8; N]>],
     offset_mask: u64,
-    cached_head: u32,
-    cached_tail: u32,
+    cached_head: u64,
+    cached_tail: u64,
 }
 
 pub struct PushError;
@@ -52,19 +49,24 @@ impl<'ring, const N: usize> Producer<'ring, N> {
         }
 
         assert!(map.info.size_ring.is_power_of_two());
-        let offset_mask = map.info.size_ring - 1;
+        assert!(map.info.size_slot_entry.is_power_of_two());
+        assert!(map.info.size_slot_entry % map.info.size_slot_entry == 0);
+
+        let count = map.info.size_ring / map.info.size_slot_entry;
+        let offset_mask = count - 1;
         let ring = cell_as_arrays(map.ring);
 
         let head = map.head.select_producer(map.side);
         let tail = map.head.select_consumer(!map.side);
 
-        let cached_head = head.load(atomic::Ordering::Relaxed);
-        let cached_tail = head.load(atomic::Ordering::Acquire);
+        let cached_head = head.load(atomic::Ordering::Relaxed).into();
+        let cached_tail = u64::from(tail.load(atomic::Ordering::Acquire)) + count;
 
         Some(Producer {
             head,
             tail,
             offset_mask,
+            count,
             ring,
             cached_head,
             cached_tail,
@@ -73,21 +75,34 @@ impl<'ring, const N: usize> Producer<'ring, N> {
 }
 
 impl<const N: usize> Producer<'_, N> {
-    pub fn push(&mut self, data: &[u8; N]) -> Result<(), PushError> {
-        todo!()
-    }
-
-    pub fn push_many<I>(&mut self, iter: I) -> usize
+    pub fn push_many<I>(&mut self, mut iter: I) -> usize
     where
         I: Iterator<Item = [u8; N]>,
     {
-        let mut n = 0;
-        todo!();
-        n
+        let mut n = self.cached_head;
+        // We applied the size as offset to the tail, to mark where we need to stop to avoid
+        // overwriting any entries not yet read.
+        while n < self.cached_tail {
+            let Some(data) = iter.next() else {
+                break;
+            };
+
+            let idx = n & self.offset_mask;
+            let slot = &self.ring[idx as usize];
+            unsafe { core::ptr::write(slot.get(), data) };
+
+            n += 1;
+        }
+
+        let count = n - self.cached_head;
+        self.cached_head = n;
+        count as usize
     }
 
     pub fn sync(&mut self) {
-        todo!()
+        self.cached_tail = u64::from(self.tail.load(atomic::Ordering::Acquire)) + self.count;
+        self.head
+            .store(self.cached_head as u32, atomic::Ordering::Release);
     }
 }
 
@@ -98,14 +113,18 @@ impl<'ring, const N: usize> Consumer<'ring, N> {
         }
 
         assert!(map.info.size_ring.is_power_of_two());
-        let offset_mask = map.info.size_ring - 1;
+        assert!(map.info.size_slot_entry.is_power_of_two());
+        assert!(map.info.size_slot_entry % map.info.size_slot_entry == 0);
+
+        let count = map.info.size_ring / map.info.size_slot_entry;
+        let offset_mask = count - 1;
         let ring = cell_as_arrays(map.ring);
 
         let head = map.head.select_producer(!map.side);
         let tail = map.head.select_consumer(map.side);
 
-        let cached_head = head.load(atomic::Ordering::Relaxed);
-        let cached_tail = head.load(atomic::Ordering::Acquire);
+        let cached_head = head.load(atomic::Ordering::Acquire).into();
+        let cached_tail = tail.load(atomic::Ordering::Relaxed).into();
 
         Some(Consumer {
             head,
@@ -117,15 +136,23 @@ impl<'ring, const N: usize> Consumer<'ring, N> {
         })
     }
 
-    pub fn iter(&mut self) -> impl Iterator<Item = [u8; N]> {
-        todo!();
-        core::iter::empty()
+    pub fn removable(&self) -> core::ops::Range<u64> {
+        self.cached_tail..self.cached_head
     }
-}
 
-impl<const N: usize> Consumer<'_, N> {
+    pub fn iter(&mut self) -> impl Iterator<Item = [u8; N]> + '_ {
+        (self.cached_tail..self.cached_head).map(|idx| {
+            let idx = idx & self.offset_mask;
+            let slot = &self.ring[idx as usize];
+            self.cached_tail += 1;
+            unsafe { core::ptr::read(slot.get()) }
+        })
+    }
+
     pub fn sync(&mut self) {
-        todo!()
+        self.cached_head = u64::from(self.head.load(atomic::Ordering::Acquire));
+        self.tail
+            .store(self.cached_tail as u32, atomic::Ordering::Release);
     }
 }
 

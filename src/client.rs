@@ -27,6 +27,7 @@ pub struct RingRequest {
     pub tid: data::ClientIdentifier,
 }
 
+#[derive(Debug)]
 pub struct RingAttributes {
     /// The offset at which to find this rings head structure.
     pub offset_head: data::ShOffset,
@@ -335,6 +336,13 @@ impl Ring {
         self.map.ring_slot.borrow_map(self.ring.borrow_all())
     }
 
+    pub(crate) fn borrow_data(&self) -> &'_ cell::UnsafeCell<[u8]> {
+        self.map
+            .ring_slot
+            .borrow_data(self.ring.borrow_all())
+            .unwrap()
+    }
+
     /// Get the producer head for this ring, given its correct size.
     pub fn producer<const N: usize>(&mut self) -> Option<ring::Producer<'_, N>> {
         ring::Producer::new(self.borrow_map()?)
@@ -343,6 +351,22 @@ impl Ring {
     /// Get the producer head for this ring, given its correct size.
     pub fn consumer<const N: usize>(&mut self) -> Option<ring::Consumer<'_, N>> {
         ring::Consumer::new(self.borrow_map()?)
+    }
+
+    pub unsafe fn copy_to(&self, data: &[u8], at: u64) {
+        let ring_data = self.borrow_data();
+        let len = data.len().try_into().unwrap();
+        let portion =
+            OwnedRingSlot::slice_cell(ring_data, data::ShOffset(at), len).expect("Out of bounds");
+        core::ptr::copy_nonoverlapping(data.as_ptr(), portion.get() as *mut u8, data.len());
+    }
+
+    pub unsafe fn copy_from(&self, data: &mut [u8], at: u64) {
+        let ring_data = self.borrow_data();
+        let len = data.len().try_into().unwrap();
+        let portion =
+            OwnedRingSlot::slice_cell(ring_data, data::ShOffset(at), len).expect("Out of bounds");
+        core::ptr::copy_nonoverlapping(portion.get() as *mut u8, data.as_mut_ptr(), data.len());
     }
 
     pub(crate) fn shared_ring(&self) -> &frame::Shared {
@@ -511,13 +535,20 @@ impl OwnedRingSlot {
         })
     }
 
+    fn borrow_data<'lt>(
+        &self,
+        all: &'lt cell::UnsafeCell<[u8]>,
+    ) -> Option<&'lt cell::UnsafeCell<[u8]>> {
+        OwnedRingSlot::slice_cell(all, self.info.offset_data, self.info.size_data)
+    }
+
     fn slice_cell(
         all: &cell::UnsafeCell<[u8]>,
         offset: data::ShOffset,
         length: u64,
     ) -> Option<&cell::UnsafeCell<[u8]>> {
         let (_, data) = Self::split_cell(all, offset.0)?;
-        let (data, _) = Self::split_cell(all, length)?;
+        let (data, _) = Self::split_cell(data, length)?;
         Some(data)
     }
 

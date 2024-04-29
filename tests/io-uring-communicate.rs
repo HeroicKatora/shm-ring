@@ -6,7 +6,7 @@ use user_ring::io_uring::ShmIoUring;
 use user_ring::server::{RingConfig, RingVersion, Server, ServerConfig};
 
 use memmap2::MmapRaw;
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, hash::Hash as _, time::Duration};
 use tempfile::NamedTempFile;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -35,12 +35,24 @@ async fn sync_rings() {
     let ioring = ShmIoUring::new(&shared).unwrap();
     rhs.activate();
     lhs.activate();
+
+    let (rhs, lhs) = tokio::join!(producer_task(rhs), consumer_task(lhs));
+    assert_eq!(rhs.2, lhs.2);
+
+    let mut pairs = rhs.1.iter().zip(lhs.1.iter());
+    if let Some(pos) = pairs.position(|(a, b)| *a != *b) {
+        // Definitely fails if we are in the if, only for printing the fault
+        assert_eq!(rhs.1[pos..], lhs.1[pos..]);
+    }
+
+    assert_eq!(rhs.0, lhs.0);
 }
 
 const PAGE_SIZE: usize = 4096;
 
-async fn producer_task(mut ring: Ring) {
+async fn producer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
     let attributes = ring.info();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let frame_count = attributes.size_data / PAGE_SIZE as u64;
 
     let cmd_image = std::env::args().next().unwrap();
@@ -50,14 +62,27 @@ async fn producer_task(mut ring: Ring) {
     // Initially everything is empty.
     let mut empty_frames: Vec<_> = (0..frame_count).collect();
     let mut full_frames = VecDeque::new();
+    let mut buffer = vec![0; PAGE_SIZE];
+    let mut all_data = vec![];
+    let mut frame_order = vec![];
 
-    let mut fill_frames = |empty: &mut Vec<u64>, full: &mut VecDeque<u64>| {
+    let mut fill_frames = |empty: &mut Vec<u64>, full: &mut VecDeque<u64>, ring: &Ring| {
         while let Some(fidx) = empty.pop() {
+            buffer.clear();
+
             let Some(chars) = data.next() else {
                 empty.push(fidx);
                 return false;
             };
 
+            buffer.extend_from_slice(chars);
+            buffer.resize(PAGE_SIZE, 0u8);
+            u8::hash_slice(&buffer, &mut hasher);
+            frame_order.push(fidx);
+            all_data.extend_from_slice(&buffer);
+
+            let at = fidx * PAGE_SIZE as u64;
+            unsafe { ring.copy_to(&buffer, at) };
             full.push_back(fidx);
         }
 
@@ -70,8 +95,9 @@ async fn producer_task(mut ring: Ring) {
         // concretely sized ring in the type system.
         let mut reap = ring.consumer::<8>().unwrap();
         empty_frames.extend(reap.iter().map(u64::from_le_bytes));
+        reap.sync();
 
-        if !fill_frames(&mut empty_frames, &mut full_frames) && full_frames.is_empty() {
+        if !fill_frames(&mut empty_frames, &mut full_frames, &ring) && full_frames.is_empty() {
             break;
         }
 
@@ -80,25 +106,63 @@ async fn producer_task(mut ring: Ring) {
             let fidx = full_frames.pop_front()?;
             Some(fidx.to_le_bytes())
         }));
+        produce.sync();
+
+        tokio::task::yield_now().await;
     }
 
     ring.deactivate();
+
+    (core::hash::Hasher::finish(&hasher), all_data, frame_order)
 }
 
-async fn consumer_task(mut ring: Ring) {
-    let attributes = ring.info();
+async fn consumer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
     let mut ready_frames = VecDeque::new();
     let mut done_frames = vec![];
+    let mut buffer = vec![0; PAGE_SIZE];
+    let mut all_data = vec![];
+    let mut frame_order = vec![];
+
+    let mut dump_frames = |ready: &mut VecDeque<u64>, done: &mut Vec<u64>, ring: &Ring| {
+        let drain = ready.drain(..);
+        let drain = drain.inspect(|&fidx| {
+            frame_order.push(fidx);
+            let at = fidx * PAGE_SIZE as u64;
+            unsafe { ring.copy_from(buffer.as_mut_slice(), at) };
+            u8::hash_slice(&buffer, &mut hasher);
+            all_data.extend_from_slice(&buffer);
+        });
+
+        done.extend(drain);
+    };
 
     while ring.is_active_remote() {
         let mut recv = ring.consumer::<8>().unwrap();
-        ready_frames.extend(reap.iter().map(u64::from_le_bytes));
+        recv.removable();
+        ready_frames.extend(recv.iter().map(u64::from_le_bytes));
+        recv.sync();
 
-        dump_frames(&mut ready_frames, &mut done_frames);
+        dump_frames(&mut ready_frames, &mut done_frames, &ring);
 
-        todo!()
+        let mut returnf = ring.producer::<8>().unwrap();
+        returnf.push_many(core::iter::from_fn(|| {
+            let fidx = done_frames.pop()?;
+            Some(fidx.to_le_bytes())
+        }));
+        returnf.sync();
+
+        tokio::task::yield_now().await;
     }
+
+    let mut recv = ring.consumer::<8>().unwrap();
+    ready_frames.extend(recv.iter().map(u64::from_le_bytes));
+    recv.sync();
+
+    dump_frames(&mut ready_frames, &mut done_frames, &ring);
+
+    (core::hash::Hasher::finish(&hasher), all_data, frame_order)
 }
 
 fn _setup_server() -> (Shared, Server) {

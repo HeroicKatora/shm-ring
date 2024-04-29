@@ -166,6 +166,11 @@ impl Server {
             Ok(start)
         }
 
+        if range.start % Self::PAGE_SIZE != 0 {
+            let offset = Self::PAGE_SIZE - range.start % Self::PAGE_SIZE;
+            allocate(&mut range, offset)?;
+        }
+
         for (info, cfg) in info.iter_mut().zip(cfg) {
             // FIXME: actually do we care? I really don't know.
             if !cfg.slot_entry_size.is_power_of_two() {
@@ -182,8 +187,14 @@ impl Server {
 
             // One page for the ring's head.
             let offset_head = allocate(&mut range, Self::PAGE_SIZE)?;
-            let offset_ring = allocate(&mut range, Self::page_requirement(cfg.ring_size)?)?;
-            let offset_data = allocate(&mut range, Self::page_requirement(cfg.data_size)?)?;
+            let offset_ring = allocate(
+                &mut range,
+                Self::page_requirement(cfg.ring_size)? * Self::PAGE_SIZE,
+            )?;
+            let offset_data = allocate(
+                &mut range,
+                Self::page_requirement(cfg.data_size)? * Self::PAGE_SIZE,
+            )?;
 
             *info.version.get_mut() = 1;
             info.offset_head = data::ShOffset(offset_head);
