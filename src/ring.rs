@@ -1,10 +1,15 @@
 //! Implement the types to operate on a ring.
 //!
 //! Construct these types through a [`crate::client::Ring`], see [`client::Client`] or [`server::Server`].
-use core::{cell::UnsafeCell, ptr};
+use core::{cell::UnsafeCell, ptr, sync::atomic};
 
 use crate::data;
 
+/// Crate internal interface for constructing producer and consumers.
+///
+/// For simplicity we always send the whole ring's informations, and have the component itself
+/// figure out which of these pointers to utilize. In particular, this is always borrowed
+/// data and such can be mapped down to the right references.
 pub(crate) struct Map<'ring> {
     pub(crate) info: &'ring data::RingInfo,
     pub(crate) head: &'ring data::RingHead,
@@ -17,15 +22,25 @@ struct Cache {
 }
 
 pub struct Producer<'ring, const N: usize> {
-    map: Map<'ring>,
-    offset_mask: u64,
+    /// The slot of the local head to indicate how many are filled.
+    head: &'ring atomic::AtomicU32,
+    /// The slot of the remote to indicate what has been read.
+    tail: &'ring atomic::AtomicU32,
     ring: &'ring [UnsafeCell<[u8; N]>],
+    offset_mask: u64,
+    cached_head: u32,
+    cached_tail: u32,
 }
 
 pub struct Consumer<'ring, const N: usize> {
-    map: Map<'ring>,
-    offset_mask: u64,
+    /// The slot of the remote to indicate what has been read.
+    tail: &'ring atomic::AtomicU32,
+    /// The slot of the local head to indicate how many are filled.
+    head: &'ring atomic::AtomicU32,
     ring: &'ring [UnsafeCell<[u8; N]>],
+    offset_mask: u64,
+    cached_head: u32,
+    cached_tail: u32,
 }
 
 pub struct PushError;
@@ -40,10 +55,19 @@ impl<'ring, const N: usize> Producer<'ring, N> {
         let offset_mask = map.info.size_ring - 1;
         let ring = cell_as_arrays(map.ring);
 
+        let head = map.head.select_producer(map.side);
+        let tail = map.head.select_consumer(!map.side);
+
+        let cached_head = head.load(atomic::Ordering::Relaxed);
+        let cached_tail = head.load(atomic::Ordering::Acquire);
+
         Some(Producer {
-            map,
+            head,
+            tail,
             offset_mask,
             ring,
+            cached_head,
+            cached_tail,
         })
     }
 }
@@ -51,6 +75,15 @@ impl<'ring, const N: usize> Producer<'ring, N> {
 impl<const N: usize> Producer<'_, N> {
     pub fn push(&mut self, data: &[u8; N]) -> Result<(), PushError> {
         todo!()
+    }
+
+    pub fn push_many<I>(&mut self, iter: I) -> usize
+    where
+        I: Iterator<Item = [u8; N]>,
+    {
+        let mut n = 0;
+        todo!();
+        n
     }
 
     pub fn sync(&mut self) {
@@ -68,11 +101,25 @@ impl<'ring, const N: usize> Consumer<'ring, N> {
         let offset_mask = map.info.size_ring - 1;
         let ring = cell_as_arrays(map.ring);
 
+        let head = map.head.select_producer(!map.side);
+        let tail = map.head.select_consumer(map.side);
+
+        let cached_head = head.load(atomic::Ordering::Relaxed);
+        let cached_tail = head.load(atomic::Ordering::Acquire);
+
         Some(Consumer {
-            map,
+            head,
+            tail,
             offset_mask,
             ring,
+            cached_head,
+            cached_tail,
         })
+    }
+
+    pub fn iter(&mut self) -> impl Iterator<Item = [u8; N]> {
+        todo!();
+        core::iter::empty()
     }
 }
 

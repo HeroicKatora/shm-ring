@@ -6,7 +6,7 @@ use user_ring::io_uring::ShmIoUring;
 use user_ring::server::{RingConfig, RingVersion, Server, ServerConfig};
 
 use memmap2::MmapRaw;
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 use tempfile::NamedTempFile;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -35,23 +35,69 @@ async fn sync_rings() {
     let ioring = ShmIoUring::new(&shared).unwrap();
     rhs.activate();
     lhs.activate();
-
 }
 
 const PAGE_SIZE: usize = 4096;
 
 async fn producer_task(mut ring: Ring) {
+    let attributes = ring.info();
+    let frame_count = attributes.size_data / PAGE_SIZE as u64;
+
     let cmd_image = std::env::args().next().unwrap();
     let data = tokio::fs::read(cmd_image).await.unwrap();
-    let data = data.chunks(4096);
+    let mut data = data.chunks(4096);
 
-    while data.len() > 0 {
+    // Initially everything is empty.
+    let mut empty_frames: Vec<_> = (0..frame_count).collect();
+    let mut full_frames = VecDeque::new();
+
+    let mut fill_frames = |empty: &mut Vec<u64>, full: &mut VecDeque<u64>| {
+        while let Some(fidx) = empty.pop() {
+            let Some(chars) = data.next() else {
+                empty.push(fidx);
+                return false;
+            };
+
+            full.push_back(fidx);
+        }
+
+        true
+    };
+
+    loop {
         // FIXME: idiomatically, why the need for an unwrap here. Should we not check this property
         // statically when you join the ring or allow a transform from an unsized ring to a
         // concretely sized ring in the type system.
-        let mut produce = ring.producer::<8>().unwrap();
+        let mut reap = ring.consumer::<8>().unwrap();
+        empty_frames.extend(reap.iter().map(u64::from_le_bytes));
 
-        produce.
+        if !fill_frames(&mut empty_frames, &mut full_frames) && full_frames.is_empty() {
+            break;
+        }
+
+        let mut produce = ring.producer::<8>().unwrap();
+        produce.push_many(core::iter::from_fn(|| {
+            let fidx = full_frames.pop_front()?;
+            Some(fidx.to_le_bytes())
+        }));
+    }
+
+    ring.deactivate();
+}
+
+async fn consumer_task(mut ring: Ring) {
+    let attributes = ring.info();
+
+    let mut ready_frames = VecDeque::new();
+    let mut done_frames = vec![];
+
+    while ring.is_active_remote() {
+        let mut recv = ring.consumer::<8>().unwrap();
+        ready_frames.extend(reap.iter().map(u64::from_le_bytes));
+
+        dump_frames(&mut ready_frames, &mut done_frames);
+
+        todo!()
     }
 }
 

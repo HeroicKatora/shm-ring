@@ -289,6 +289,7 @@ impl Ring {
         }
     }
 
+    /// Indicate we are ready to publish messages.
     pub fn activate(&self) -> i32 {
         let indicator = self.map.local_indicator();
         indicator.store(1, atomic::Ordering::Relaxed);
@@ -296,6 +297,15 @@ impl Ring {
         slot.wake(i32::MAX)
     }
 
+    /// Indicate we do not intend to publish messages.
+    pub fn deactivate(&self) -> i32 {
+        let indicator = self.map.local_indicator();
+        indicator.store(0, atomic::Ordering::Relaxed);
+        let slot: &Futex<Shared> = indicator.as_futex();
+        slot.wake(i32::MAX)
+    }
+
+    /// Check (relaxed) whether the remote intends to publish messages.
     pub fn is_active_remote(&self) -> bool {
         let indicator = self.map.remote_indicator();
         indicator.load(atomic::Ordering::Relaxed) != 0
