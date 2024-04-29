@@ -81,6 +81,10 @@ impl Shared {
         self.head.aligned_tail as *const UnsafeCell<[u8]>
     }
 
+    pub(crate) fn borrow_all(&self) -> &'_ UnsafeCell<[u8]> {
+        self.head.all
+    }
+
     pub fn tail_offset(&self) -> usize {
         let aligned_addr = self.head.aligned_tail as *const _ as *const u8 as usize;
         let head_addr = self.head.all as *const _ as *const u8 as usize;

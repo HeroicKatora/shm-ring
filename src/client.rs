@@ -1,4 +1,4 @@
-use core::{alloc, mem, ptr, sync::atomic, time};
+use core::{alloc, cell, mem, ptr, sync::atomic, time};
 
 use linux_futex::{AsFutex, Futex, Shared};
 
@@ -321,22 +321,18 @@ impl Ring {
     ///
     /// Since we borrow `self` here, the ring itself is ensured to outlive the borrowed map to the
     /// references whose memory is held alive by the ring.
-    pub(crate) fn borrow_map(&self) -> ring::Map<'_> {
-        ring::Map {
-            info: self.map.ring_slot.info,
-            head: self.map.ring_slot.head,
-            side: self.map.ring_slot.side,
-        }
+    pub(crate) fn borrow_map(&self) -> Option<ring::Map<'_>> {
+        self.map.ring_slot.borrow_map(self.ring.borrow_all())
     }
 
     /// Get the producer head for this ring, given its correct size.
     pub fn producer<const N: usize>(&mut self) -> Option<ring::Producer<'_, N>> {
-        ring::Producer::new(self.borrow_map())
+        ring::Producer::new(self.borrow_map()?)
     }
 
     /// Get the producer head for this ring, given its correct size.
     pub fn consumer<const N: usize>(&mut self) -> Option<ring::Consumer<'_, N>> {
-        ring::Consumer::new(self.borrow_map())
+        ring::Consumer::new(self.borrow_map()?)
     }
 
     pub(crate) fn shared_ring(&self) -> &frame::Shared {
@@ -494,6 +490,45 @@ impl OwnedRingSlot {
         };
 
         producer.wake(i32::MAX) as u32
+    }
+
+    fn borrow_map<'lt>(&self, all: &'lt cell::UnsafeCell<[u8]>) -> Option<ring::Map<'lt>> {
+        Some(ring::Map {
+            info: self.info,
+            head: self.head,
+            side: self.side,
+            ring: Self::slice_cell(all, self.info.offset_ring, self.info.size_ring)?,
+        })
+    }
+
+    fn slice_cell(
+        all: &cell::UnsafeCell<[u8]>,
+        offset: data::ShOffset,
+        length: u64,
+    ) -> Option<&cell::UnsafeCell<[u8]>> {
+        let (_, data) = Self::split_cell(all, offset.0)?;
+        let (data, _) = Self::split_cell(all, length)?;
+        Some(data)
+    }
+
+    fn split_cell(
+        cell: &cell::UnsafeCell<[u8]>,
+        start: u64,
+    ) -> Option<(&cell::UnsafeCell<[u8]>, &cell::UnsafeCell<[u8]>)> {
+        let available = core::mem::size_of_val(cell);
+        let len_first = start.try_into().ok().filter(|n| *n <= available)?;
+        let len_second = available.checked_sub(len_first).unwrap();
+
+        let start_first = cell as *const _ as *const cell::UnsafeCell<u8>;
+        let start_second = unsafe { start_first.add(len_first) };
+
+        let cell_first = ptr::slice_from_raw_parts(start_first, len_first);
+        let cell_second = ptr::slice_from_raw_parts(start_second, len_second);
+
+        Some((
+            unsafe { &*(cell_first as *const cell::UnsafeCell<[u8]>) },
+            unsafe { &*(cell_second as *const cell::UnsafeCell<[u8]>) },
+        ))
     }
 }
 
