@@ -213,6 +213,11 @@ impl Client {
 }
 
 impl Ring {
+    /// Get the identity used when joining the ring.
+    pub fn identity(&self) -> data::ClientIdentifier {
+        self.map.ring_slot.identity
+    }
+
     /// Give up the ring, in favor of a potentially different client, without de-initializing.
     ///
     /// The ring passes the condition for reaping the ring to that other process.
@@ -482,10 +487,6 @@ impl RingAssertion<'_> {
 }
 
 impl RingMap {
-    fn local_producer(&self) -> &atomic::AtomicU32 {
-        self.ring_slot.head.select_producer(self.ring_slot.side)
-    }
-
     fn remote_producer(&self) -> &atomic::AtomicU32 {
         self.ring_slot.head.select_producer(!self.ring_slot.side)
     }

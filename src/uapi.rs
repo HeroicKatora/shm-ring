@@ -105,17 +105,6 @@ pub fn futex_waitv(waiters: &mut [FutexWaitv], timeout: Duration) -> Result<i64,
 static __HIDDEN: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
 impl FutexWaitv<'static> {
-    /// A futex waiter that always wakes immediately (with EAGAIN).
-    pub fn ready() -> Self {
-        FutexWaitv {
-            val: 1,
-            addr: &__HIDDEN as *const _ as u64,
-            _addr_owner: PhantomData,
-            flags: FutexWaitv::ATOMIC_U32,
-            __reserved: 0,
-        }
-    }
-
     /// A futex that never resolves.
     pub fn pending() -> Self {
         FutexWaitv {
