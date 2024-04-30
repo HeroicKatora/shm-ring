@@ -53,6 +53,11 @@ async fn sync_rings() {
 
     let ring = ShmIoUring::new(&shared).unwrap();
 
+    assert!(
+        ring.is_supported().expect("Probing works").any(),
+        "Your OS does not support the Futex operations required"
+    );
+
     let (locked, woken) = tokio::join!(
         ring.lock_for_message(&rhs, Duration::from_millis(1_000)),
         async {

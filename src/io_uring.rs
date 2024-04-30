@@ -34,6 +34,14 @@ pub struct ShmIoUring {
     poller: NotifyOnDrop,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SupportLevel {
+    /// We do not support this platform.
+    None,
+    /// The basic operations work.
+    V1,
+}
+
 struct NotifyOnDrop(Arc<Notify>);
 
 impl Drop for NotifyOnDrop {
@@ -103,6 +111,24 @@ impl ShmIoUring {
             notify: SlotMap::new().into(),
             stable_timeouts: Default::default(),
             poller: NotifyOnDrop(abort),
+        })
+    }
+
+    pub fn is_supported(&self) -> Result<SupportLevel, std::io::Error> {
+        let mut probe = io_uring::Probe::new();
+
+        self.io_uring
+            .borrow_mut()
+            .submitter()
+            .register_probe(&mut probe)?;
+
+        let support = probe.is_supported(io_uring::opcode::FutexWaitV::CODE)
+            && probe.is_supported(io_uring::opcode::FutexWaitV::CODE)
+            && probe.is_supported(io_uring::opcode::FutexWake::CODE);
+
+        Ok(match support {
+            false => SupportLevel::None,
+            true => SupportLevel::V1,
         })
     }
 
@@ -451,6 +477,15 @@ impl Submit<'_> {
         self.timeout
             .extend(core::iter::repeat(None).take(non_timeouts));
         self.timeout.extend(to.map(Some));
+    }
+}
+
+impl SupportLevel {
+    pub fn any(self) -> bool {
+        match self {
+            SupportLevel::None => false,
+            _ => true,
+        }
     }
 }
 

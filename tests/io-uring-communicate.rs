@@ -33,6 +33,12 @@ async fn sync_rings() {
     let rhs = join_rhs.expect("Have initialized right side");
 
     let ioring = ShmIoUring::new(&shared).unwrap();
+
+    assert!(
+        ioring.is_supported().expect("Probing works").any(),
+        "Your OS does not support the Futex operations required"
+    );
+
     rhs.activate();
     lhs.activate();
 
