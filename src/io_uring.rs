@@ -34,11 +34,17 @@ pub struct ShmIoUring {
     poller: NotifyOnDrop,
 }
 
+/// Signal the level of operational readiness of the underlying platform.
 #[derive(Clone, Copy, Debug)]
 pub enum SupportLevel {
     /// We do not support this platform.
+    ///
+    /// Expect some operations to fail when utilized. The failure may result in various error codes
+    /// but not memory corruption, although errors may be confusing and inconsistent.
     None,
     /// The basic operations work.
+    ///
+    /// This will work with Linux `6.8`, usually.
     V1,
 }
 
@@ -59,6 +65,8 @@ struct Submit<'cell> {
 struct KeyOwner<'own>(DefaultKey, &'own ShmIoUring, Rc<Semaphore>);
 
 /// Some memory allocation which we reference in `submit`.
+///
+/// The only relevant feature here is that the type be `Drop`.
 trait SubmitAllocation {}
 
 impl<T: 'static> SubmitAllocation for T {}
@@ -114,6 +122,7 @@ impl ShmIoUring {
         })
     }
 
+    /// Query the kernel, which necessary operations are supported.
     pub fn is_supported(&self) -> Result<SupportLevel, std::io::Error> {
         let mut probe = io_uring::Probe::new();
 

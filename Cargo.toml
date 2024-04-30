@@ -1,5 +1,5 @@
 [package]
-name = "user-ring"
+name = "shm-pbx"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.70"
@@ -26,10 +26,19 @@ tokio = { version = "1", optional = true, features = ["macros", "net", "sync", "
 #
 # FIXME: disable these defaults? We want to have a true choice.
 default = ["uapi", "io-uring"]
+# The IO-uring state tracking needs slotmap. We're using tokio for eventing a
+# file descriptor, spawning a background task to maintain it, and
+# Notify/Semaphore asynchronous coordination.
 io-uring = ["dep:io-uring", "dep:slotmap", "tokio"]
+bin = ["uapi", "io-uring"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "shm-pbx-server"
+path = "src/bin/server/main.rs"
+required-featurs = ["bin"]
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -443,6 +443,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "shm-pbx"
+version = "0.0.0"
+dependencies = [
+ "hashbrown 0.14.3",
+ "io-uring",
+ "linux-futex",
+ "memmap2",
+ "slotmap",
+ "tempfile",
+ "tokio",
+ "uapi",
+]
+
+[[package]]
 name = "slotmap"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -584,20 +598,6 @@ name = "unicode-ident"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3354b9ac3fae1ff6755cb6db53683adb661634f67557942dea4facebec0fee4b"
-
-[[package]]
-name = "user-ring"
-version = "0.0.0"
-dependencies = [
- "hashbrown 0.14.3",
- "io-uring",
- "linux-futex",
- "memmap2",
- "slotmap",
- "tempfile",
- "tokio",
- "uapi",
-]
 
 [[package]]
 name = "version_check"
