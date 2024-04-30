@@ -1,12 +1,12 @@
 #![cfg(feature = "io-uring")]
-use user_ring::client::{Ring, RingRequest, WaitResult};
+use user_ring::client::{Ring, RingRequest};
 use user_ring::data::{ClientIdentifier, ClientSide, RingIndex};
 use user_ring::frame::Shared;
 use user_ring::io_uring::ShmIoUring;
 use user_ring::server::{RingConfig, RingVersion, Server, ServerConfig};
 
 use memmap2::MmapRaw;
-use std::{collections::VecDeque, hash::Hash as _, time::Duration};
+use std::{collections::VecDeque, hash::Hash as _};
 use tempfile::NamedTempFile;
 
 #[tokio::test(flavor = "multi_thread")]

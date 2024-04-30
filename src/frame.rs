@@ -160,15 +160,18 @@ impl Shared {
         (self.head.ring, ownership)
     }
 
-    pub(crate) fn owns_client(&self, client: &client::Client) -> bool {
+    /// Is the client operating on the same underlying file?
+    pub fn same_client(&self, client: &client::Client) -> bool {
         Arc::ptr_eq(&self._retain, &client.shared_ring()._retain)
     }
 
-    pub(crate) fn owns_server(&self, server: &server::Server) -> bool {
+    /// Is the server operating on the same underlying file?
+    pub fn same_server(&self, server: &server::Server) -> bool {
         Arc::ptr_eq(&self._retain, &server.shared_ring()._retain)
     }
 
-    pub(crate) fn owns_ring(&self, client: &client::Ring) -> bool {
+    /// Is the ring operating on the same underlying file?
+    pub fn same_ring(&self, client: &client::Ring) -> bool {
         Arc::ptr_eq(&self._retain, &client.shared_ring()._retain)
     }
 }

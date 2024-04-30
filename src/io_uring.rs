@@ -141,7 +141,7 @@ impl ShmIoUring {
         ring: &Ring,
         timeout: time::Duration,
     ) -> Result<WaitResult, std::io::Error> {
-        assert!(self.shared_user_ring.owns_ring(ring));
+        assert!(self.shared_user_ring.same_ring(ring));
 
         let head = ring.ring_head();
         let blocking = &head.blocked.0;
@@ -194,7 +194,7 @@ impl ShmIoUring {
         ring: &Ring,
         timeout: time::Duration,
     ) -> Result<WaitResult, std::io::Error> {
-        assert!(self.shared_user_ring.owns_ring(ring));
+        assert!(self.shared_user_ring.same_ring(ring));
         let assertion = match ring.lock_for_message() {
             Ok(guard) => guard,
             Err(err) => return Ok(err),
@@ -242,7 +242,7 @@ impl ShmIoUring {
         head: u32,
         timeout: time::Duration,
     ) -> Result<WaitResult, std::io::Error> {
-        assert!(self.shared_user_ring.owns_ring(ring));
+        assert!(self.shared_user_ring.same_ring(ring));
         let submit = self.non_empty_submission_and_then_sync(2).await?;
 
         let rhead = ring.ring_head();
@@ -289,7 +289,7 @@ impl ShmIoUring {
     }
 
     pub async fn wake(&self, ring: &Ring) -> Result<u32, std::io::Error> {
-        assert!(self.shared_user_ring.owns_ring(ring));
+        assert!(self.shared_user_ring.same_ring(ring));
         let submit = self.non_empty_submission_and_then_sync(2).await?;
 
         let head = ring.ring_head();
