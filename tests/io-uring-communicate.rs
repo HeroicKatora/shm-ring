@@ -58,37 +58,30 @@ const PAGE_SIZE: usize = 4096;
 
 async fn producer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
     let attributes = ring.info();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     let frame_count = attributes.size_data / PAGE_SIZE as u64;
 
     let cmd_image = std::env::args().next().unwrap();
-    let data = tokio::fs::read(cmd_image).await.unwrap();
-    let mut data = data.chunks(4096);
+    let mut buffer = tokio::fs::read(cmd_image).await.unwrap();
+    let encoded_len = (buffer.len() as u64).to_le_bytes();
+    buffer.splice(0..0, encoded_len);
+    let mut data = buffer.chunks(4096);
 
     // Initially everything is empty.
     let mut empty_frames: Vec<_> = (0..frame_count).collect();
     let mut full_frames = VecDeque::new();
-    let mut buffer = vec![0; PAGE_SIZE];
-    let mut all_data = vec![];
     let mut frame_order = vec![];
 
     let mut fill_frames = |empty: &mut Vec<u64>, full: &mut VecDeque<u64>, ring: &Ring| {
         while let Some(fidx) = empty.pop() {
-            buffer.clear();
-
             let Some(chars) = data.next() else {
                 empty.push(fidx);
                 return false;
             };
 
-            buffer.extend_from_slice(chars);
-            buffer.resize(PAGE_SIZE, 0u8);
-            u8::hash_slice(&buffer, &mut hasher);
             frame_order.push(fidx);
-            all_data.extend_from_slice(&buffer);
-
             let at = fidx * PAGE_SIZE as u64;
-            unsafe { ring.copy_to(&buffer, at) };
+
+            unsafe { ring.copy_to(chars, at) };
             full.push_back(fidx);
         }
 
@@ -118,17 +111,17 @@ async fn producer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
     }
 
     ring.deactivate();
-
-    (core::hash::Hasher::finish(&hasher), all_data, frame_order)
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    u8::hash_slice(&buffer, &mut hasher);
+    (core::hash::Hasher::finish(&hasher), buffer, frame_order)
 }
 
 async fn consumer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
     let mut ready_frames = VecDeque::new();
     let mut done_frames = vec![];
-    let mut buffer = vec![0; PAGE_SIZE];
-    let mut all_data = vec![];
+
+    let mut frame = vec![0; PAGE_SIZE];
+    let mut buffer = vec![];
     let mut frame_order = vec![];
 
     let mut dump_frames = |ready: &mut VecDeque<u64>, done: &mut Vec<u64>, ring: &Ring| {
@@ -136,9 +129,8 @@ async fn consumer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
         let drain = drain.inspect(|&fidx| {
             frame_order.push(fidx);
             let at = fidx * PAGE_SIZE as u64;
-            unsafe { ring.copy_from(buffer.as_mut_slice(), at) };
-            u8::hash_slice(&buffer, &mut hasher);
-            all_data.extend_from_slice(&buffer);
+            unsafe { ring.copy_from(frame.as_mut_slice(), at) };
+            buffer.extend_from_slice(&frame);
         });
 
         done.extend(drain);
@@ -168,7 +160,11 @@ async fn consumer_task(mut ring: Ring) -> (u64, Vec<u8>, Vec<u64>) {
 
     dump_frames(&mut ready_frames, &mut done_frames, &ring);
 
-    (core::hash::Hasher::finish(&hasher), all_data, frame_order)
+    let encoded_len = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+    buffer.truncate(encoded_len as usize + 8);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    u8::hash_slice(&buffer, &mut hasher);
+    (core::hash::Hasher::finish(&hasher), buffer, frame_order)
 }
 
 fn _setup_server() -> (Shared, Server) {
