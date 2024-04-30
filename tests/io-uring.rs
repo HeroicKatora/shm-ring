@@ -1,9 +1,9 @@
 #![cfg(feature = "io-uring")]
-use user_ring::client::{RingRequest, WaitResult};
-use user_ring::data::{ClientIdentifier, ClientSide, RingIndex};
-use user_ring::frame::Shared;
-use user_ring::io_uring::ShmIoUring;
-use user_ring::server::{RingConfig, RingVersion, ServerConfig};
+use shm_pbx::client::{RingRequest, WaitResult};
+use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
+use shm_pbx::frame::Shared;
+use shm_pbx::io_uring::ShmIoUring;
+use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 
 use memmap2::MmapRaw;
 use std::time::Duration;

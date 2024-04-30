@@ -1,9 +1,9 @@
 #![cfg(feature = "io-uring")]
-use user_ring::client::{Ring, RingRequest};
-use user_ring::data::{ClientIdentifier, ClientSide, RingIndex};
-use user_ring::frame::Shared;
-use user_ring::io_uring::ShmIoUring;
-use user_ring::server::{RingConfig, RingVersion, Server, ServerConfig};
+use shm_pbx::client::{Ring, RingRequest};
+use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
+use shm_pbx::frame::Shared;
+use shm_pbx::io_uring::ShmIoUring;
+use shm_pbx::server::{RingConfig, RingVersion, Server, ServerConfig};
 
 use memmap2::MmapRaw;
 use std::{collections::VecDeque, hash::Hash as _};
