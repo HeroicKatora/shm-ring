@@ -7,6 +7,7 @@ rust-version = "1.70"
 [dependencies]
 io-uring = { version = "0.6", optional = true }
 hashbrown = "0.14.3"
+# Synchronous waiting with a futex interface
 linux-futex = "0.2"
 memmap2 = "0.9"
 # Using the high-level crate instead of `libc` as an abstraction of safe
@@ -16,6 +17,11 @@ memmap2 = "0.9"
 uapi = { version = "0.2.13", optional = true }
 slotmap = { version = "1", optional = true, default-features = false }
 tokio = { version = "1", optional = true, features = ["macros", "net", "sync", "rt"] }
+
+# Just binaries, this is our interface.
+quick-error = "1"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 # We should call these required features, but the goal is to allow pivot to
@@ -30,7 +36,7 @@ default = ["uapi", "io-uring"]
 # file descriptor, spawning a background task to maintain it, and
 # Notify/Semaphore asynchronous coordination.
 io-uring = ["dep:io-uring", "dep:slotmap", "tokio"]
-bin = ["uapi", "io-uring"]
+bin = ["uapi", "io-uring", "dep:serde", "dep:serde_json", "serde/derive"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -38,7 +44,7 @@ crate-type = ["cdylib", "lib"]
 [[bin]]
 name = "shm-pbx-server"
 path = "src/bin/server/main.rs"
-required-featurs = ["bin"]
+required-features = ["bin"]
 
 [dev-dependencies]
 tempfile = "3.10"
