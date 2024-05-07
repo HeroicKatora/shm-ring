@@ -67,6 +67,7 @@ quick_error! {
         IoUring (err: std::io::Error) {
             from(err: ServeIoUring) -> (err.0)
         }
+        UnsupportedOs {}
     }
 }
 
@@ -145,6 +146,10 @@ fn main() -> Result<(), Error> {
 
 async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServeError> {
     let uring = ShmIoUring::new(&shared).map_err(ServeIoUring)?;
+
+    if !uring.is_supported().map_err(ServeIoUring)?.any() {
+        return Err(ServerServeError::UnsupportedOs);
+    }
 
     let rings: Vec<_> = options
         .rings

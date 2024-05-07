@@ -109,6 +109,7 @@ impl ShmIoUring {
                 };
 
                 notify.notify_waiters();
+                tokio::task::yield_now().await;
             }
         });
 
@@ -465,7 +466,12 @@ impl ShmIoUring {
         let mut notify = self.notify.borrow_mut();
         let completion = ring.completion();
 
+        // FIXME: log this somewhere? Some potentially concurrent or even parallel insight into the
+        // cycles here might be appreciated.
+        let mut _n = 0;
         for entry in completion {
+            _n += 1;
+
             let data = KeyData::from_ffi(entry.user_data());
             let key = DefaultKey::from(data);
             let result: i32 = entry.result();
@@ -497,7 +503,6 @@ impl KeyOwner<'_> {
     }
 
     async fn wait(&self) -> Result<i64, i32> {
-        // eprintln!("Waiting {}", self.as_user_data());
         let permit = loop {
             tokio::select! {
                 permit = self.2.acquire() => {

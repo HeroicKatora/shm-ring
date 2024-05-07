@@ -13,10 +13,10 @@ extern crate alloc;
 pub mod client;
 pub mod data;
 pub mod frame;
-/// Contains all code to interacts with the OS directly.
-mod uapi;
 pub mod ring;
 pub mod server;
+/// Contains all code to interacts with the OS directly.
+mod uapi;
 
 #[cfg(feature = "io-uring")]
 pub mod io_uring;
