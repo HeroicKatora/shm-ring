@@ -19,9 +19,11 @@ slotmap = { version = "1", optional = true, default-features = false }
 tokio = { version = "1", optional = true, features = ["macros", "net", "sync", "rt"] }
 
 # Just binaries, this is our interface.
-quick-error = "1"
+clap = { version = "4", optional = true }
+quick-error = { version = "1", optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+tempfile = { version = "3.10", optional = true }
 
 [features]
 # We should call these required features, but the goal is to allow pivot to
@@ -36,7 +38,18 @@ default = ["uapi", "io-uring"]
 # file descriptor, spawning a background task to maintain it, and
 # Notify/Semaphore asynchronous coordination.
 io-uring = ["dep:io-uring", "dep:slotmap", "tokio"]
-bin = ["uapi", "io-uring", "dep:serde", "dep:serde_json", "serde/derive"]
+
+bin = [
+  "clap/cargo",
+  "io-uring",
+  "uapi",
+  "quick-error",
+  "dep:clap",
+  "dep:serde",
+  "dep:serde_json",
+  "serde/derive",
+  "dep:tempfile",
+]
 
 [lib]
 crate-type = ["cdylib", "lib"]

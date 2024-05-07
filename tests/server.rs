@@ -1,7 +1,7 @@
-use user_ring::client::RingRequest;
-use user_ring::data::{ClientIdentifier, ClientSide, RingIndex};
-use user_ring::frame::Shared;
-use user_ring::server::{RingConfig, RingVersion, ServerConfig};
+use shm_pbx::client::RingRequest;
+use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
+use shm_pbx::frame::Shared;
+use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 
 use memmap2::MmapRaw;
 use tempfile::NamedTempFile;

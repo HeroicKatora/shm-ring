@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "size": 1048576,
+  "rings": [
+    {
+      "version": 1,
+      "ring_size": 1024,
+      "slot_entry_size": 8,
+      "data_size": 4096
+    }
+  ]
+}

@@ -6,11 +6,12 @@
 /// kept alive while submitted operations are running on the ring, until the completions are found.
 use crate::client::{Ring, WaitResult};
 use crate::frame::Shared;
+use crate::server::Server;
 use crate::uapi::FutexWaitv;
 
 use alloc::collections::VecDeque;
 use alloc::{rc::Rc, sync::Arc};
-use core::{cell, time};
+use core::{cell, sync::atomic, time};
 
 use io_uring::{opcode, IoUring};
 use slotmap::{DefaultKey, Key, KeyData, SlotMap};
@@ -141,6 +142,61 @@ impl ShmIoUring {
         })
     }
 
+    pub async fn wait_server(
+        &self,
+        server: &Server,
+        timeout: time::Duration,
+    ) -> Result<WaitResult, std::io::Error> {
+        assert!(self.shared_user_ring.same_server(server));
+
+        let head = server.head();
+        let assertion = &head.ring_ping.ring_ping.0;
+        let loaded = assertion.load(atomic::Ordering::Relaxed);
+        let cmp = head.ring_ping.ring_pong.0.load(atomic::Ordering::Relaxed);
+
+        if loaded.wrapping_sub(cmp) as i32 > 0 {
+            return Ok(WaitResult::Ok);
+        }
+
+        let submit = self.non_empty_submission_and_then_sync(2).await?;
+
+        // FIXME: this is a remarkably clean copy of what we do in `lock_for_message`. Is that
+        // incidental or structural? I don't like deduplicating it immediately out of concerns the
+        // server might want to wake on a different, other signal in this same futex call.
+        let mut wakes = Rc::new([(); 1].map(|_| FutexWaitv::pending()));
+        let [fblock] = Rc::get_mut(&mut wakes).unwrap();
+
+        // Safety: we're owning the ring, which the block references. This keeps it alive for as
+        // long as this futex wait is in the kernel, i.e. until everything was reaped. If we can't,
+        // the Arc is leaked thus keeping the io-uring itself alive with the memory mapping.
+        *fblock = unsafe { FutexWaitv::from_u32_unchecked(assertion, loaded) };
+
+        let key = self.establish_notice();
+        let entry = opcode::FutexWaitV::new(Rc::as_ptr(&wakes) as *const _, 1)
+            .build()
+            .user_data(key.as_user_data())
+            .flags(io_uring::squeue::Flags::IO_LINK);
+
+        let timespec = Rc::new(uapi::c::timespec {
+            tv_nsec: timeout.subsec_nanos().into(),
+            tv_sec: timeout.as_secs() as uapi::c::time_t,
+        });
+
+        // Safety: the reference-counted pointers of wakes and timespec are passed. The entries
+        // submitted are also otherwise valid.
+        let entry_to = opcode::Timeout::new(Rc::as_ptr(&timespec) as *const _).build();
+        unsafe { submit.redeem_push(&[entry, entry_to], [wakes, timespec]) };
+
+        Ok(match key.wait().await {
+            Ok(0) => WaitResult::Ok,
+            Err(FutexWaitv::EAGAIN) => WaitResult::Error,
+            Err(FutexWaitv::ETIMEDOUT) => WaitResult::Timeout,
+            Err(FutexWaitv::ERESTARTSYS) => WaitResult::Restart,
+            Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
+            Ok(_) => WaitResult::Error,
+        })
+    }
+
     // We do not implement `activate` here, which is a single futex wake call, since semantics of
     // dropping it in progress are not entirely fruitful. Sure, one can just restart that sequence
     // despite already being active but what.
@@ -154,7 +210,7 @@ impl ShmIoUring {
 
         let head = ring.ring_head();
         let blocking = &head.blocked.0;
-        let loaded = blocking.load(core::sync::atomic::Ordering::Relaxed);
+        let loaded = blocking.load(atomic::Ordering::Relaxed);
 
         // Line is going down.
         if (loaded as i32) < 0 {

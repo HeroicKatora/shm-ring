@@ -150,6 +150,10 @@ impl Server {
         &self.ring
     }
 
+    pub(crate) fn head(&self) -> &data::ShmHead {
+        &self.server.head
+    }
+
     fn offsets(
         info: &mut [data::RingInfo],
         cfg: &[RingConfig],
