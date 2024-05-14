@@ -62,6 +62,8 @@ pub struct RingConfig {
     pub ring_size: u64,
     pub data_size: u64,
     pub slot_entry_size: u64,
+    pub rhs: i32,
+    pub lhs: i32,
 }
 
 impl Server {
@@ -146,6 +148,22 @@ impl Server {
         })
     }
 
+    pub fn bring_up(&self, ids: &[RingConfig]) -> usize {
+        let mut success = 0;
+
+        for (slot, ids) in self.server.info.into_iter().zip(ids) {
+            if let Some(id) = data::RingIdentifier::new(ids.rhs) {
+                success += usize::from(slot.rhs.reinit(id).is_ok());
+            }
+
+            if let Some(id) = data::RingIdentifier::new(ids.lhs) {
+                success += usize::from(slot.lhs.reinit(id).is_ok());
+            }
+        }
+
+        success
+    }
+
     pub(crate) fn shared_ring(&self) -> &frame::Shared {
         &self.ring
     }
@@ -200,6 +218,9 @@ impl Server {
                 Self::page_requirement(cfg.data_size)? * Self::PAGE_SIZE,
             )?;
 
+            let lhs = if cfg.lhs < 0 { cfg.lhs } else { 0i32 };
+            let rhs = if cfg.rhs < 0 { cfg.rhs } else { 0i32 };
+
             *info.version.get_mut() = 1;
             info.offset_head = data::ShOffset(offset_head);
             info.offset_ring = data::ShOffset(offset_ring);
@@ -208,8 +229,8 @@ impl Server {
             info.size_ring = cfg.ring_size;
             info.size_data = cfg.data_size;
             info.size_slot_entry = cfg.slot_entry_size;
-            info.lhs = data::ClientSlot::for_advertisement(-1i32, 0);
-            info.rhs = data::ClientSlot::for_advertisement(-1i32, 0);
+            info.lhs = data::ClientSlot::for_advertisement(lhs, 0);
+            info.rhs = data::ClientSlot::for_advertisement(rhs, 0);
         }
 
         Ok(())

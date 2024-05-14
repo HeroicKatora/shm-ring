@@ -226,6 +226,14 @@ impl ClientIdentifier {
 }
 
 impl RingIdentifier {
+    pub fn new(id: i32) -> Option<Self> {
+        if id < 0 {
+            Some(RingIdentifier(id))
+        } else {
+            None
+        }
+    }
+
     pub fn to_slot_id(self) -> u32 {
         self.0 as u32
     }
@@ -242,7 +250,10 @@ impl ClientSlot {
     }
 
     /// Atomically exchange the slot with a request to join with a specific client.
-    pub fn insert(&self, client: ClientIdentifier) -> Result<RingIdentifier, ClientIdentifier> {
+    pub fn insert(
+        &self,
+        client: ClientIdentifier,
+    ) -> Result<RingIdentifier, Option<ClientIdentifier>> {
         let client = client.0 as i32;
         assert!(client > 0, "Invalid client ID");
         let client = client as u32;
@@ -252,14 +263,38 @@ impl ClientSlot {
         let acquisition =
             self.owner
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n: u32| {
-                    Some(client).filter(|_| n as i32 <= 0)
+                    Some(client).filter(|_| (n as i32) < 0)
                 });
 
         match acquisition {
             Ok(id) => Ok(RingIdentifier(id as i32)),
+            Err(0) => Err(None),
             Err(id) => {
                 debug_assert!(id > 0);
-                Err(ClientIdentifier(id as u64))
+                Err(Some(ClientIdentifier(id as u64)))
+            }
+        }
+    }
+
+    pub fn reinit(&self, ring: RingIdentifier) -> Result<(), Option<ClientIdentifier>> {
+        let token: i32 = ring.0;
+        assert!(token < 0, "Invalid client ID");
+        let token = token as u32;
+
+        let acquisition =
+            self.owner
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n: u32| {
+                    Some(token).filter(|_| n == 0)
+                });
+
+        match acquisition {
+            Ok(_id) => Ok(debug_assert_eq!(_id, 0)),
+            Err(id) => {
+                if id > 0 {
+                    Err(Some(ClientIdentifier(id as u64)))
+                } else {
+                    Err(None)
+                }
             }
         }
     }
@@ -275,14 +310,14 @@ impl ClientSlot {
             .map(|_| ())
     }
 
-    pub fn inspect(&self) -> Result<ClientIdentifier, RingIdentifier> {
+    pub fn inspect(&self) -> Result<ClientIdentifier, Option<RingIdentifier>> {
         let id: u32 = self.owner.load(Ordering::Relaxed);
         let id = id as i32;
 
-        if id > 0 {
-            Ok(ClientIdentifier(id as u64))
-        } else {
-            Err(RingIdentifier(id as i32))
+        match id {
+            0 => Err(None),
+            1.. => Ok(ClientIdentifier(id as u64)),
+            id => Err(Some(RingIdentifier(id))),
         }
     }
 }

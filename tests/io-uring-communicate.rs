@@ -184,6 +184,8 @@ fn _setup_server() -> (Shared, Server) {
         // 0x100 frames of page size each.
         data_size: 0x400_000,
         slot_entry_size: 0x8,
+        lhs: -1,
+        rhs: -1,
     }];
 
     let shared_server = shared.clone();

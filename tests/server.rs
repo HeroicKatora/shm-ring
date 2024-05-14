@@ -23,6 +23,8 @@ fn create_server() {
         ring_size: 0x10,
         data_size: 0x1234,
         slot_entry_size: 0x8,
+        rhs: -1,
+        lhs: -1,
     }];
 
     let shared_client = shared.clone();
@@ -76,8 +78,17 @@ fn create_server() {
     assert!(join_rhs.is_ok());
     drop(join_rhs);
 
-    // We can join it again.
+    // We can not immediately join it again, we've given the slot up to the server.
     let tid = ClientIdentifier::new();
+    let join_rhs = client.join(&RingRequest {
+        side: ClientSide::Right,
+        index: RingIndex(0),
+        tid,
+    });
+
+    assert!(join_rhs.is_err());
+    server.bring_up(&rings);
+
     let join_rhs = client.join(&RingRequest {
         side: ClientSide::Right,
         index: RingIndex(0),

@@ -64,6 +64,8 @@ pub enum RingJoinError {
     BadRingOffsetRing,
     Unsupported,
     Taken(data::ClientIdentifier),
+    /// The ring is currently not initialized, i.e. being cleaned up.
+    Unavailable,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,7 +185,11 @@ impl Client {
             .ok_or(RingJoinError::BadRingOffsetRing)?;
 
         let slot = ring_info.select_slot(req.side);
-        let ring_id = slot.insert(req.tid).map_err(RingJoinError::Taken)?;
+        let ring_id = match slot.insert(req.tid) {
+            Ok(id) => id,
+            Err(None) => return Err(RingJoinError::Unavailable),
+            Err(Some(id)) => return Err(RingJoinError::Taken(id)),
+        };
 
         // Immediately afterwards we are responsible for that region.
         let owned_ring = OwnedRingSlot {

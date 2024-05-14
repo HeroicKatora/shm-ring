@@ -24,6 +24,8 @@ fn create_server() {
         ring_size: 0x10,
         data_size: 0x1234,
         slot_entry_size: 0x8,
+        lhs: -1,
+        rhs: -1,
     }];
 
     let shared_client = shared.clone();
