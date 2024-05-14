@@ -39,7 +39,7 @@ pub struct RingClientPing(pub AtomicU32);
 pub struct RingServerPong(pub AtomicU32);
 
 /// A slot with which a client can register to a ring..
-#[repr(C, align(64))]
+#[repr(C, align(8))]
 pub struct ClientSlot {
     /// The current owner of this slot. That is:
     /// - a positive value, always a PID, if the slot is owned by a process.
@@ -66,8 +66,14 @@ pub enum ClientSide {
 #[repr(transparent)]
 pub struct ShOffset(pub u64);
 
-/// Number of U32 values to pad, to avoid cache interference between atomics.
-const ANTI_INTERFERENCE_PADDING_U32: usize = 31;
+/// Number of bytes to have, to avoid cache interference between atomics.
+///
+/// Assumes that the start of structures with this size are also aligned to that same value. The
+/// value *is* used but never at runtime which might make the compiler assume it is not. It
+/// protects some index assertions which we can not write with `assert!`, at least not without
+/// losing the diagnostics of the actual value on their failure.
+#[allow(dead_code)]
+const ANTI_INTERFERENCE_ALIGN_AND_SIZE: usize = 256;
 
 /// Published by the server, information on the ring and a slot for registering as a client to the
 /// ring via an atomic CAS.
@@ -94,13 +100,23 @@ pub struct RingInfo {
     /// The byte size of each entry in the rings slot structure.
     pub size_slot_entry: u64,
     // Here we are at 8 · 8 byte.
+    pub _padding0: NoAccess<UnsafeCell<[u64; 24]>>,
+    // Here we are at 32 · 8 byte.
     pub lhs: ClientSlot,
-    pub _padding0: NoAccess<UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>>,
-    // Here we are at 12 · 8 byte
+    pub _padding2: NoAccess<UnsafeCell<[u64; 31]>>,
+    // Here we are at 64 · 8 byte
     pub rhs: ClientSlot,
-    pub _padding1: NoAccess<UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>>,
+    pub _padding1: NoAccess<UnsafeCell<[u64; 31]>>,
     // Here we are at 16 · 8 byte
+    pub _eos: [u8; 0],
 }
+
+const _: () = {
+    const ASSERT: [(); 1] = [(); 1];
+    ASSERT[(core::mem::offset_of!(RingInfo, lhs) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+    ASSERT[(core::mem::offset_of!(RingInfo, rhs) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+    ASSERT[(core::mem::offset_of!(RingInfo, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+};
 
 #[repr(C)]
 pub struct RingHead {
@@ -113,10 +129,14 @@ pub struct RingHead {
     ///
     /// While active, this is also a Priority-Inversion futex.
     pub blocked: RingBlockedSlot,
-    pub _padding0: NoAccess<UnsafeCell<[u64; ANTI_INTERFERENCE_PADDING_U32]>>,
+    pub _padding0: NoAccess<UnsafeCell<[u64; 31]>>,
+    pub _eos: [u8; 0],
 }
 
 const _: () = {
+    const ASSERT: [(); 1] = [(); 1];
+    ASSERT[(core::mem::offset_of!(RingHead, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+
     assert!(
         core::mem::size_of::<RingHead>() <= 4096,
         "Gotta fix code that assumes this rounds up to a single page."
@@ -129,9 +149,9 @@ pub struct RingBlockedSlot(pub(crate) AtomicU32);
 #[repr(C)]
 pub struct RingHeadHalf {
     pub producer: AtomicU32,
-    pub _padding0: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
+    pub _padding0: NoAccess<UnsafeCell<[u32; 63]>>,
     pub consumer: AtomicU32,
-    pub _padding1: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
+    pub _padding1: NoAccess<UnsafeCell<[u32; 63]>>,
     /// A flag, signalling whether the producer is currently active.
     ///
     /// One can futex-wait on this to wait for resumption. Note that this is not the same as
@@ -145,8 +165,20 @@ pub struct RingHeadHalf {
     /// is deactivate momentarily. (Note this is separate from `RingHead::blocked`'s attribute).
     /// Each transition should wake any futex blocked on the value.
     pub send_indicator: AtomicU32,
-    pub _padding2: NoAccess<UnsafeCell<[u32; ANTI_INTERFERENCE_PADDING_U32]>>,
+    pub _padding2: NoAccess<UnsafeCell<[u32; 63]>>,
+    pub _eos: [u8; 0],
 }
+
+const _: () = {
+    const ASSERT: [(); 1] = [(); 1];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, producer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)
+        as usize];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, consumer) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)
+        as usize];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, send_indicator) % ANTI_INTERFERENCE_ALIGN_AND_SIZE)
+        as usize];
+    ASSERT[(core::mem::offset_of!(RingHeadHalf, _eos) % ANTI_INTERFERENCE_ALIGN_AND_SIZE) as usize];
+};
 
 /// Wraps memory, not allowing *any* access.
 ///
