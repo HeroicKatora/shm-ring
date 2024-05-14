@@ -64,4 +64,4 @@ tempfile = "3.10"
 tokio = { version = "1", features = ["fs", "macros", "io-util", "rt-multi-thread"] }
 
 [workspace]
-members = [".", "xtask/cbindgen"]
+members = [".", "examples/client-wasi", "xtask/cbindgen"]

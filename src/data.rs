@@ -240,11 +240,9 @@ impl RingIdentifier {
 }
 
 impl ClientSlot {
-    pub(crate) fn for_advertisement(owner: i32, tag: u32) -> Self {
-        assert!(owner < 0);
-
+    pub(crate) fn for_advertisement(owner: RingIdentifier, tag: u32) -> Self {
         ClientSlot {
-            owner: (owner as u32).into(),
+            owner: (owner.0 as u32).into(),
             tag: tag.into(),
         }
     }

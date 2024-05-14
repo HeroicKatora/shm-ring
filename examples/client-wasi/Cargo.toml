@@ -1,0 +1,8 @@
+[package]
+name = "client-wasi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmtime = "20.0"
+wasmtime-wasi = "20.0"

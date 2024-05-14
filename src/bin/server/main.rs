@@ -1,8 +1,7 @@
 use core::{num::NonZeroU64, time::Duration};
+use std::os::fd::AsRawFd as _;
 use std::{fs, path::PathBuf};
 
-use shm_pbx::client::RingRequest;
-use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::io_uring::ShmIoUring;
 use shm_pbx::server::{RingConfig, RingVersion, ServerConfig, ServerError, ServerTask};
@@ -46,9 +45,9 @@ struct RingOptions {
     /// which may be used fully between them.
     data_size: u64,
     /// The ID to advertise on the left of this ring when it falls to the server.
-    lhs_id: Option<i64>,
+    lhs_id: Option<i32>,
     /// The ID to advertise on the right of this ring when it falls to the server.
-    rhs_id: Option<i64>,
+    rhs_id: Option<i32>,
 }
 
 quick_error! {
@@ -135,6 +134,12 @@ fn main() -> Result<(), Error> {
     // Fulfills all the pre-conditions of alignment to map.
     let shared = Shared::new(map).ok_or(OptionsError::FailedToUseMap)?;
 
+    {
+        let pid = uapi::getpid();
+        let fid = file.as_raw_fd();
+        eprintln!("/proc/{pid}/fd/{fid}");
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()?;
@@ -159,6 +164,8 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
             ring_size: opt.ring_size,
             data_size: opt.data_size,
             slot_entry_size: opt.slot_entry_size,
+            rhs: opt.rhs_id.unwrap_or(0),
+            lhs: opt.lhs_id.unwrap_or(0),
         })
         .collect();
 
@@ -168,10 +175,11 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
     let mut task = ServerTask::default();
 
     loop {
-        uring
+        let waiter = uring
             .wait_server(&server, duration)
             .await
             .map_err(ServeIoUring)?;
+        let _ = waiter;
 
         server.collect_fds(&mut task);
 

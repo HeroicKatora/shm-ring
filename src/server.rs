@@ -229,8 +229,14 @@ impl Server {
             info.size_ring = cfg.ring_size;
             info.size_data = cfg.data_size;
             info.size_slot_entry = cfg.slot_entry_size;
-            info.lhs = data::ClientSlot::for_advertisement(lhs, 0);
-            info.rhs = data::ClientSlot::for_advertisement(rhs, 0);
+
+            if let Some(id) = data::RingIdentifier::new(lhs) {
+                info.lhs = data::ClientSlot::for_advertisement(id, 0);
+            }
+
+            if let Some(id) = data::RingIdentifier::new(rhs) {
+                info.rhs = data::ClientSlot::for_advertisement(id, 0);
+            }
         }
 
         Ok(())
