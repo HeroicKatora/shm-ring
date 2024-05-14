@@ -47,7 +47,23 @@ pub struct ClientSlot {
     /// - a negative value if the slot is available, advertising some tag.
     pub owner: AtomicU32,
     /// An additional info advertised by the owner. Only the owner should write here.
-    pub tag: AtomicU32,
+    ///
+    /// It's discouraged to write here directly, use the provided methods instead to interact
+    /// nicely with other clients that might utilize these for detecting a remote pair with certain
+    /// assumed behavior.
+    pub tag: [AtomicU32; 15],
+}
+
+/// An advertised tag, further identifying a client which has acquired a slot.
+///
+/// The major difference to the owner tag is that this value is larger but can not be modified
+/// atomically. It is however large enough to contain a UUID. As a convention, tags should not
+/// start with a zero value and end with the same value they were started with. This allows a lossy
+/// detection of tags which should be given a second read.
+///
+/// Also see its `From` implementations.
+pub struct ClientTag {
+    pub value: [u32; 15],
 }
 
 /// Identifies the side of the ring.
@@ -103,10 +119,10 @@ pub struct RingInfo {
     pub _padding0: NoAccess<UnsafeCell<[u64; 24]>>,
     // Here we are at 32 · 8 byte.
     pub lhs: ClientSlot,
-    pub _padding2: NoAccess<UnsafeCell<[u64; 31]>>,
+    pub _padding2: NoAccess<UnsafeCell<[u64; 24]>>,
     // Here we are at 64 · 8 byte
     pub rhs: ClientSlot,
-    pub _padding1: NoAccess<UnsafeCell<[u64; 31]>>,
+    pub _padding1: NoAccess<UnsafeCell<[u64; 24]>>,
     // Here we are at 16 · 8 byte
     pub _eos: [u8; 0],
 }
@@ -272,10 +288,10 @@ impl RingIdentifier {
 }
 
 impl ClientSlot {
-    pub(crate) fn for_advertisement(owner: RingIdentifier, tag: u32) -> Self {
+    pub(crate) fn for_advertisement(owner: RingIdentifier) -> Self {
         ClientSlot {
             owner: (owner.0 as u32).into(),
-            tag: tag.into(),
+            tag: [0; 15].map(AtomicU32::new),
         }
     }
 
@@ -349,6 +365,24 @@ impl ClientSlot {
             1.. => Ok(ClientIdentifier(id as u64)),
             id => Err(Some(RingIdentifier(id))),
         }
+    }
+
+    /// Read the tag from this slot.
+    ///
+    /// Note that the read is not atomic. And without having joined the ring, you need not assume
+    /// that it remained unchanged even if fenced by two `inspect` calls that yield the same value
+    /// (i.e. ABA problem).
+    pub fn tag(&self) -> ClientTag {
+        let value = ClientTag::_IDX.map(|idx| self.tag[usize::from(idx)].load(Ordering::Acquire));
+        ClientTag { value }
+    }
+}
+
+impl ClientTag {
+    const _IDX: [u8; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+
+    pub fn is_conventional(&mut self) -> bool {
+        self.value.first() == self.value.last()
     }
 }
 

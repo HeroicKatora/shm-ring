@@ -231,11 +231,11 @@ impl Server {
             info.size_slot_entry = cfg.slot_entry_size;
 
             if let Some(id) = data::RingIdentifier::new(lhs) {
-                info.lhs = data::ClientSlot::for_advertisement(id, 0);
+                info.lhs = data::ClientSlot::for_advertisement(id);
             }
 
             if let Some(id) = data::RingIdentifier::new(rhs) {
-                info.rhs = data::ClientSlot::for_advertisement(id, 0);
+                info.rhs = data::ClientSlot::for_advertisement(id);
             }
         }
 
