@@ -385,6 +385,12 @@ checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
 name = "client-wasi"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "clap 4.5.4",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "shm-pbx",
  "wasmtime",
  "wasmtime-wasi",
 ]
