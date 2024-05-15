@@ -60,6 +60,7 @@ async fn sync_rings() {
         "Your OS does not support the Futex operations required"
     );
 
+    eprintln!("Sending message");
     let (locked, woken) = tokio::join!(
         ring.lock_for_message(&rhs, Duration::from_millis(1_000)),
         async {
@@ -84,6 +85,7 @@ async fn sync_rings() {
         rhs.activate();
     });
 
+    eprintln!("Activating");
     let (joiner, active) = tokio::join!(hdl, async {
         loop {
             let waited = ring

@@ -182,6 +182,9 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
         let _ = waiter;
 
         server.collect_fds(&mut task);
+        if server.bring_up(&rings) > 0 {
+            eprintln!("Reaped some clients");
+        }
 
         std::hint::spin_loop();
         std::thread::yield_now();

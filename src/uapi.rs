@@ -121,6 +121,7 @@ impl FutexWaitv<'static> {
     pub const EAGAIN: i32 = ::uapi::c::EAGAIN;
     pub const ETIMEDOUT: i32 = ::uapi::c::ETIMEDOUT;
     pub const ERESTARTSYS: i32 = ::uapi::c::ERESTART;
+    pub const ECANCELED: i32 = ::uapi::c::ECANCELED;
 
     pub unsafe fn from_u32_unchecked(atomic: &'_ atomic::AtomicU32, val: u32) -> Self {
         FutexWaitv {
