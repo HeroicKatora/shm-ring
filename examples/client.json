@@ -1,5 +1,5 @@
 {
-	"module": "target/wasm32-wasi/release/client",
+	"module": "../target/wasm32-wasi/release/fizz-buzz.wasm",
 	"stdin": {
 		"index": 0,
 		"side": "right"

@@ -695,6 +695,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fizz-buzz"
+version = "0.0.0"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

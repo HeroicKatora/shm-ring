@@ -147,6 +147,9 @@ fn main() -> Result<(), Error> {
     let engine = wasmtime::Engine::new(&config)?;
 
     let module = opt_path.join(options.module);
+    eprintln!("{}", module.display());
+    module.canonicalize()?;
+
     let module = std::fs::read(module)?;
     let module = wasmtime::component::Component::new(&engine, module)?;
 
@@ -205,7 +208,7 @@ async fn communicate(shared: Shared, program: Program) -> Result<(), ClientRunEr
     let mut linker = wasmtime::component::Linker::<MainData>::new(&program.engine);
 
     let mut store = Store::new(&program.engine, main);
-    wasmtime_wasi::add_to_linker_async(&mut linker);
+    wasmtime_wasi::add_to_linker_async(&mut linker)?;
 
     let instance = linker
         .instantiate_async(&mut store, &program.module)
