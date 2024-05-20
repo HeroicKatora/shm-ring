@@ -1,4 +1,7 @@
 {
-	"index": 0,
-	"side": "right"
+	"module": "target/wasm32-wasi/release/client",
+	"stdin": {
+		"index": 0,
+		"side": "right"
+	}
 }

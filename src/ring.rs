@@ -75,10 +75,11 @@ impl<'ring, const N: usize> Producer<'ring, N> {
 }
 
 impl<const N: usize> Producer<'_, N> {
-    pub fn push_many<I>(&mut self, mut iter: I) -> usize
+    pub fn push_many<I>(&mut self, iter: I) -> usize
     where
-        I: Iterator<Item = [u8; N]>,
+        I: IntoIterator<Item = [u8; N]>,
     {
+        let mut iter = iter.into_iter();
         let mut n = self.cached_head;
         // We applied the size as offset to the tail, to mark where we need to stop to avoid
         // overwriting any entries not yet read.

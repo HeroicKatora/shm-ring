@@ -388,9 +388,11 @@ dependencies = [
  "bytes",
  "clap 4.5.4",
  "memmap2",
+ "quick-error",
  "serde",
  "serde_json",
  "shm-pbx",
+ "tokio",
  "wasmtime",
  "wasmtime-wasi",
 ]
