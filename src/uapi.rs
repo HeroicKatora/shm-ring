@@ -1,3 +1,5 @@
+use tokio::io::unix::AsyncFd;
+
 use crate::data;
 use core::{marker::PhantomData, sync::atomic, time::Duration};
 
@@ -38,6 +40,12 @@ impl data::ClientIdentifier {
     #[cfg(feature = "uapi")]
     pub(crate) fn open_pid(self) -> Result<OwnedFd, uapi::Errno> {
         uapi::pidfd_open(self.pid(), uapi::c::PIDFD_NONBLOCK).map(OwnedFd)
+    }
+}
+
+impl OwnedFd {
+    pub fn into_async(self) -> Result<AsyncFd<uapi::OwnedFd>, std::io::Error> {
+        AsyncFd::new(self.0)
     }
 }
 

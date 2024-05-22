@@ -28,11 +28,11 @@ pub struct OutputRing {
 }
 
 struct OutputInner {
-    ring: Ring,
     notify_produced: Notify,
     buffer: Mutex<VecDeque<Bytes>>,
     flush_level: atomic::AtomicUsize,
     flushed: atomic::AtomicUsize,
+    buffer_space_size: u64,
 }
 
 struct Available(u64);
@@ -65,25 +65,37 @@ const fn usable_power_of_two_size_u64(size: u64) -> u64 {
     size & and_mask
 }
 
+fn split_ring(available: &Range<&mut u64>, buffer_space_size: u64) -> (Range<usize>, u64) {
+    // Split the ring's buffer into two memories, like a VecDeque<u8>.
+    let start_offset = *available.start % buffer_space_size;
+    // In case we want to a maximum size on each Bytes, just min this.
+    let size = (*available.end).checked_sub(*available.start).unwrap();
+
+    assert!(size <= buffer_space_size);
+    let first_capacity = buffer_space_size - start_offset;
+
+    let second_size = size.saturating_sub(first_capacity);
+    let first_size = size - second_size;
+    (first_size as usize..size as usize, start_offset)
+}
+
 impl InputRing {
-    pub fn new(mut ring: Ring, on: Arc<ShmIoUring>) -> Self {
+    pub fn new(mut ring: Ring, on: Arc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
         let buffer_space_size = usable_power_of_two_size(&ring);
 
         let inner = Arc::new(InputInner {
             notify_produced: Notify::new(),
             notify_consumed: Semaphore::const_new(32),
             buffer: Mutex::default(),
-            // FIXME: not only a single page.
             buffer_space_size,
         });
-
-        let hdl = inner.clone();
 
         // Time between gratuitous runs of the loop, which might be needed to retry the release of
         // acknowledgements when those are consumed slowly.
         let recheck_time = core::time::Duration::from_millis(10);
+        let hdl = inner.clone();
 
-        let _task = tokio::task::spawn_local(async move {
+        let _task = local.spawn_local(async move {
             let mut available = Available(0u64);
             let mut sequence = 0u64;
             let mut released = 0u64;
@@ -111,7 +123,7 @@ impl InputRing {
 
                 let mut guard = hdl.buffer.lock().unwrap();
                 let range = (&mut sequence)..(&mut available.0);
-                Self::fill_frame(&hdl, range, &mut guard, &ring);
+                Self::consume_stream(&hdl, range, &mut guard, &ring);
 
                 // Acknowledge the receipt, free buffer space.
                 if sequence != released {
@@ -131,22 +143,15 @@ impl InputRing {
         InputRing { inner }
     }
 
-    fn fill_frame(
+    fn consume_stream(
         inner: &InputInner,
         available: Range<&mut u64>,
         full: &mut VecDeque<Bytes>,
         ring: &Ring,
     ) {
-        // Split the ring's buffer into two memories, like a VecDeque<u8>.
-        let start_offset = *available.start % inner.buffer_space_size;
         // In case we want to a maximum size on each Bytes, just min this.
-        let size = (*available.end).checked_sub(*available.start).unwrap();
-
-        assert!(size <= inner.buffer_space_size);
-        let first_capacity = inner.buffer_space_size - start_offset;
-
-        let second_size = size.saturating_sub(first_capacity);
-        let first_size = size - second_size;
+        let (range, start_offset) = split_ring(&available, inner.buffer_space_size);
+        let (first_size, size) = (range.start, range.end);
 
         let mut target = vec![0; size as usize];
         unsafe { ring.copy_from(&mut target[..first_size as usize], start_offset) };
@@ -194,6 +199,114 @@ impl Subscribe for InputRing {
     }
 }
 
+impl OutputRing {
+    pub fn new(mut ring: Ring, on: Arc<ShmIoUring>, local: &tokio::task::LocalSet) -> Self {
+        let buffer_space_size = usable_power_of_two_size(&ring);
+
+        let inner = Arc::new(OutputInner {
+            notify_produced: Notify::new(),
+            buffer: Mutex::default(),
+            flush_level: 0.into(),
+            flushed: 0.into(),
+            buffer_space_size,
+        });
+
+        // Time between gratuitous runs of the loop, which might be needed to retry the release of
+        // acknowledgements when those are consumed slowly.
+        let recheck_time = core::time::Duration::from_millis(10);
+        let hdl = inner.clone();
+
+        local.spawn_local(async move {
+            let mut more_data = hdl.notify_produced.notified();
+            let mut available = Available(0u64);
+            let mut sequence = 0u64;
+            let mut released = 0u64;
+            let mut head_receive = 0;
+
+            loop {
+                // 1. wait for data having been produced.
+                more_data.await;
+
+                let mut reap = ring.consumer::<8>().unwrap();
+
+                available.extend(
+                    reap.iter()
+                        .map(u64::from_le_bytes)
+                        .inspect(|_| head_receive += 1),
+                );
+
+                reap.sync();
+
+                // Re-arm the notify while holding the guard, ensure nothing is lost.
+                let mut guard = hdl.buffer.lock().unwrap();
+                more_data = hdl.notify_produced.notified();
+
+                let range = (&mut sequence)..(&mut available.0);
+                let flush = Self::fill_stream(&hdl, range, &mut guard, &ring);
+
+                if flush > 0 {
+                    todo!();
+                }
+
+                if sequence != released {
+                    let mut produce = ring.producer::<8>().unwrap();
+
+                    if produce.push_many([u64::to_le_bytes(sequence)]) > 0 {
+                        released = sequence;
+                    }
+
+                    produce.sync();
+                }
+            }
+        });
+
+        OutputRing { inner }
+    }
+
+    #[must_use = "Flushes must be tracked"]
+    fn fill_stream(
+        inner: &OutputInner,
+        available: Range<&mut u64>,
+        full: &mut VecDeque<Bytes>,
+        ring: &Ring,
+    ) -> usize {
+        let mut flushes = 0;
+
+        loop {
+            let Some(frame) = full.front_mut() else {
+                break;
+            };
+
+            if frame.is_empty() {
+                flushes += 1;
+                full.pop_front();
+                continue;
+            }
+
+            let (range, start_offset) = split_ring(&available, inner.buffer_space_size);
+            let (first_size, free_space) = (range.start, range.end);
+
+            let split = frame.len().min(first_size);
+            let size = frame.len().min(free_space);
+
+            let first = frame.split_off(split);
+            let second = frame.split_off(size - first_size);
+
+            unsafe { ring.copy_to(&first, start_offset) };
+            unsafe { ring.copy_to(&second, 0) };
+            *available.start *= size as u64;
+
+            if free_space < size {
+                break;
+            }
+
+            full.pop_front();
+        }
+
+        flushes
+    }
+}
+
 impl HostOutputStream for OutputRing {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         if bytes.is_empty() {
@@ -201,7 +314,7 @@ impl HostOutputStream for OutputRing {
         }
 
         let mut guard = self.inner.buffer.lock().unwrap();
-        guard.push_front(bytes);
+        guard.push_back(bytes);
         Ok(())
     }
 
@@ -211,7 +324,7 @@ impl HostOutputStream for OutputRing {
             .fetch_add(1, atomic::Ordering::Relaxed);
 
         let mut guard = self.inner.buffer.lock().unwrap();
-        guard.push_front(Bytes::default());
+        guard.push_back(Bytes::default());
 
         Ok(())
     }

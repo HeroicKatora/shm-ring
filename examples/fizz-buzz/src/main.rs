@@ -1,6 +1,7 @@
 use std::io::{BufRead as _, Write as _};
 
-fn main() -> Result<(), std::io::Error> {
+#[no_mangle]
+pub fn main() -> Result<(), std::io::Error> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 

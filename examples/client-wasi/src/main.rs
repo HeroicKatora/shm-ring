@@ -9,8 +9,8 @@ use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
-use wasmtime::{component::Component, Store};
-use wasmtime_wasi::{ResourceTable, WasiCtx};
+use wasmtime::{Module, Store};
+use wasmtime_wasi::{preview1, ResourceTable, WasiCtx, WasiCtxBuilder};
 
 use std::{fs, path::PathBuf, sync};
 
@@ -29,13 +29,12 @@ struct StreamOptions {
     side: ClientSide,
 }
 
-struct MainData {
-    ctx: WasiCtx,
-    table: ResourceTable,
+struct ModuleP1Data {
+    ctx: preview1::WasiP1Ctx,
 }
 
 struct Program {
-    module: Component,
+    module: Module,
     engine: wasmtime::Engine,
     stdin: Option<Ring>,
     stdout: Option<Ring>,
@@ -78,6 +77,7 @@ quick_error! {
     }
 }
 
+/*
 impl wasmtime_wasi::WasiView for MainData {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
@@ -87,6 +87,7 @@ impl wasmtime_wasi::WasiView for MainData {
         &mut self.ctx
     }
 }
+*/
 
 fn main() -> Result<(), Error> {
     let matches = clap::command!()
@@ -147,11 +148,10 @@ fn main() -> Result<(), Error> {
     let engine = wasmtime::Engine::new(&config)?;
 
     let module = opt_path.join(options.module);
-    eprintln!("{}", module.display());
-    module.canonicalize()?;
+    let module = module.canonicalize()?;
 
     let module = std::fs::read(module)?;
-    let module = wasmtime::component::Component::new(&engine, module)?;
+    let module = Module::new(&engine, module)?;
 
     let program = Program {
         module,
@@ -165,7 +165,16 @@ fn main() -> Result<(), Error> {
         .enable_io()
         .build()?;
 
-    rt.block_on(communicate(shared, program))?;
+    rt.block_on(async {
+        let local = tokio::task::LocalSet::new();
+
+        let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
+        let uring = sync::Arc::new(uring);
+
+        communicate(uring.clone(), program, &local).await?;
+
+        Ok::<_, ClientRunError>(())
+    })?;
 
     Ok(())
 }
@@ -184,38 +193,67 @@ impl wasmtime_wasi::StdinStream for Stdin {
     }
 }
 
-async fn communicate(shared: Shared, program: Program) -> Result<(), ClientRunError> {
-    let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
-    let uring = sync::Arc::new(uring);
-
-    let main = MainData {
-        table: ResourceTable::new(),
+async fn communicate(
+    uring: sync::Arc<ShmIoUring>,
+    program: Program,
+    local: &tokio::task::LocalSet,
+) -> Result<(), ClientRunError> {
+    let main = ModuleP1Data {
         ctx: {
-            let mut ctx = WasiCtx::builder();
+            let mut ctx = WasiCtxBuilder::new();
 
             if let Some(stdin) = program.stdin {
                 let stdin = Stdin {
-                    inner: stream::InputRing::new(stdin, uring.clone()),
+                    inner: stream::InputRing::new(stdin, uring.clone(), &local),
                 };
 
                 ctx.stdin(stdin);
             }
 
-            ctx.build()
+            ctx.build_p1()
         },
     };
 
-    let mut linker = wasmtime::component::Linker::<MainData>::new(&program.engine);
+    let mut linker = wasmtime::Linker::<ModuleP1Data>::new(&program.engine);
 
     let mut store = Store::new(&program.engine, main);
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::preview1::add_to_linker_async(&mut linker, |main| &mut main.ctx)?;
 
     let instance = linker
         .instantiate_async(&mut store, &program.module)
         .await?;
 
-    let main = instance.get_typed_func::<(), (i32,)>(&mut store, "main")?;
+    let main = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     main.call_async(&mut store, ()).await?;
+
+    Ok(())
+}
+
+async fn move_stdout(
+    uring: sync::Arc<ShmIoUring>,
+    ring: Ring,
+    local: &tokio::task::LocalSet,
+) -> Result<(), ClientRunError> {
+    use tokio::io::AsyncWriteExt as _;
+    use wasmtime_wasi::{HostInputStream as _, Subscribe};
+
+    let mut proxy = stream::InputRing::new(ring, uring.clone(), &local);
+    let mut stdout = tokio::io::stdout();
+    const SIZE: usize = 1 << 12;
+
+    loop {
+        let bytes = match proxy.read(SIZE) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => {
+                proxy.ready().await;
+                continue;
+            }
+            Err(wasmtime_wasi::StreamError::Closed) => break,
+            Err(_err) => panic!(),
+        };
+
+        stdout.write_all(&bytes).await.map_err(ClientIoUring)?;
+    }
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use core::{cell, mem, ops, ptr};
 
 use hashbrown::{hash_map, HashMap, HashSet};
@@ -24,7 +24,7 @@ pub struct ServerTask {
 }
 
 struct ClientTrackingData {
-    pid: uapi::OwnedFd,
+    pid: Arc<uapi::OwnedFd>,
     rings: HashSet<(usize, data::ClientSide)>,
 }
 
@@ -71,16 +71,20 @@ impl Server {
 
     /// Walk the ring info block, collecting PID file descriptors where necessary. It is the job of
     /// the server to, eventually, deactivate the slot entries of crashed processes.
-    pub fn collect_fds(&self, track: &mut ServerTask) {
+    pub fn collect_fds(&self, track: &mut ServerTask) -> Vec<Arc<uapi::OwnedFd>> {
+        let mut count = vec![];
+
         for (idx, info) in self.server.info.into_iter().enumerate() {
             if let Ok(client) = info.lhs.inspect() {
-                track.track_client(client, idx, data::ClientSide::Left);
+                count.extend(track.track_client(client, idx, data::ClientSide::Left));
             }
 
             if let Ok(client) = info.rhs.inspect() {
-                track.track_client(client, idx, data::ClientSide::Right);
+                count.extend(track.track_client(client, idx, data::ClientSide::Right));
             }
         }
+
+        count
     }
 
     /// Initialize a server, if the configuration checks out.
@@ -253,24 +257,36 @@ impl Server {
 }
 
 impl ServerTask {
-    fn track_client(&mut self, client: data::ClientIdentifier, idx: usize, side: data::ClientSide) {
+    fn track_client(
+        &mut self,
+        client: data::ClientIdentifier,
+        idx: usize,
+        side: data::ClientSide,
+    ) -> Option<Arc<uapi::OwnedFd>> {
+        let pid;
         let entry = match self.tracker.entry(client) {
-            hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            hash_map::Entry::Occupied(entry) => {
+                pid = None;
+                entry.into_mut()
+            }
             hash_map::Entry::Vacant(entry) => {
                 // We're not going to track this client if we can't open its pid. Likely already
                 // recycled.
-                let Ok(pid) = client.open_pid() else {
-                    return;
+                let Ok(new_pid) = client.open_pid() else {
+                    return None;
                 };
 
+                let new_pid = Arc::new(new_pid);
+                pid = Some(new_pid.clone());
                 entry.insert(ClientTrackingData {
-                    pid,
+                    pid: new_pid,
                     rings: HashSet::new(),
                 })
             }
         };
 
         entry.rings.insert((idx, side));
+        pid
     }
 }
 
