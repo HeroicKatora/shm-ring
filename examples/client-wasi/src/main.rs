@@ -1,6 +1,6 @@
 mod stream;
 
-use shm_pbx::client::{Ring, RingRequest, WaitResult};
+use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest, WaitResult};
 use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::io_uring::ShmIoUring;
@@ -16,14 +16,24 @@ use std::{fs, path::PathBuf, sync};
 
 #[derive(Deserialize)]
 struct Options {
-    module: PathBuf,
+    modules: Vec<WasmModule>,
     stdin: Option<StreamOptions>,
     stdout: Option<StreamOptions>,
     stderr: Option<StreamOptions>,
 }
 
 #[derive(Deserialize)]
-struct StreamOptions {
+pub enum WasmModule {
+    WasiV1 {
+        module: PathBuf,
+        stdin: Option<StreamOptions>,
+        stdout: Option<StreamOptions>,
+        stderr: Option<StreamOptions>,
+    },
+}
+
+#[derive(Deserialize)]
+pub struct StreamOptions {
     index: usize,
     #[serde(deserialize_with = "de::deserialize_client")]
     side: ClientSide,
@@ -36,6 +46,12 @@ struct ModuleP1Data {
 struct Program {
     module: Module,
     engine: wasmtime::Engine,
+    stdin: Option<Ring>,
+    stdout: Option<Ring>,
+    stderr: Option<Ring>,
+}
+
+struct Host {
     stdin: Option<Ring>,
     stdout: Option<Ring>,
     stderr: Option<Ring>,
@@ -74,20 +90,11 @@ quick_error! {
         WasmModule (err: wasmtime::Error) {
             from()
         }
+        Join(err: RingJoinError) {
+            from()
+        }
     }
 }
-
-/*
-impl wasmtime_wasi::WasiView for MainData {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
-    }
-}
-*/
 
 fn main() -> Result<(), Error> {
     let matches = clap::command!()
@@ -130,36 +137,15 @@ fn main() -> Result<(), Error> {
     let client = shared.into_client().expect("Have initialized client");
 
     let tid = ClientIdentifier::new();
-
-    let stdin = options
-        .stdin
-        .map(|opt| {
-            client.join(&RingRequest {
-                index: RingIndex(opt.index),
-                side: opt.side,
-                tid,
-            })
-        })
-        .transpose()
-        .unwrap();
+    let mod_options = &options.modules[0];
 
     let mut config = wasmtime::Config::new();
     config.async_support(true);
     let engine = wasmtime::Engine::new(&config)?;
 
-    let module = opt_path.join(options.module);
-    let module = module.canonicalize()?;
+    let program = new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf())?;
 
-    let module = std::fs::read(module)?;
-    let module = Module::new(&engine, module)?;
-
-    let program = Program {
-        module,
-        engine: engine.clone(),
-        stdin,
-        stdout: None,
-        stderr: None,
-    };
+    let host = host(&options, &client, tid)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -171,12 +157,74 @@ fn main() -> Result<(), Error> {
         let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
         let uring = sync::Arc::new(uring);
 
-        communicate(uring.clone(), program, &local).await?;
+        tokio::try_join!(
+            communicate_host(uring.clone(), host, &local),
+            communicate(uring.clone(), program, &local),
+        )?;
 
         Ok::<_, ClientRunError>(())
     })?;
 
     Ok(())
+}
+
+fn new_program(
+    engine: &wasmtime::Engine,
+    options: &WasmModule,
+    client: &Client,
+    tid: ClientIdentifier,
+    opt_path: PathBuf,
+) -> Result<Program, Error> {
+    let WasmModule::WasiV1 {
+        module,
+        stdin,
+        stdout: _,
+        stderr: _,
+    } = &options;
+
+    let stdin = join_ring(stdin.as_ref(), client, tid)?;
+
+    let module = opt_path.join(module);
+    let module = module.canonicalize()?;
+
+    let module = std::fs::read(module)?;
+    let module = Module::new(&engine, module)?;
+
+    Ok(Program {
+        module,
+        engine: engine.clone(),
+        stdin,
+        stdout: None,
+        stderr: None,
+    })
+}
+
+fn host(options: &Options, client: &Client, tid: ClientIdentifier) -> Result<Host, Error> {
+    let stdin = join_ring(options.stdin.as_ref(), client, tid)?;
+    let stdout = join_ring(options.stdout.as_ref(), client, tid)?;
+    let stderr = join_ring(options.stderr.as_ref(), client, tid)?;
+
+    Ok(Host {
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
+fn join_ring(
+    options: Option<&StreamOptions>,
+    client: &Client,
+    tid: ClientIdentifier,
+) -> Result<Option<Ring>, RingJoinError> {
+    options
+        .map(|opt| {
+            client.join(&RingRequest {
+                index: RingIndex(opt.index),
+                side: opt.side,
+                tid,
+            })
+        })
+        .transpose()
 }
 
 struct Stdin {
@@ -225,6 +273,74 @@ async fn communicate(
 
     let main = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     main.call_async(&mut store, ()).await?;
+
+    Ok(())
+}
+
+async fn communicate_host(
+    uring: sync::Arc<ShmIoUring>,
+    host: Host,
+    local: &tokio::task::LocalSet,
+) -> Result<(), ClientRunError> {
+    tokio::try_join!(
+        async {
+            if let Some(stream) = host.stdin {
+                move_stdin(uring.clone(), stream, local).await
+            } else {
+                Ok(())
+            }
+        },
+        async {
+            if let Some(stream) = host.stdout {
+                move_stdout(uring.clone(), stream, local).await
+            } else {
+                Ok(())
+            }
+        },
+    )?;
+
+    Ok(())
+}
+
+async fn move_stdin(
+    uring: sync::Arc<ShmIoUring>,
+    ring: Ring,
+    local: &tokio::task::LocalSet,
+) -> Result<(), ClientRunError> {
+    use tokio::io::AsyncBufReadExt as _;
+    use wasmtime_wasi::HostOutputStream as _;
+
+    let mut proxy = stream::OutputRing::new(ring, uring.clone(), &local);
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+
+    const SIZE: usize = 1 << 12;
+
+    loop {
+        let buf = stdin.fill_buf().await.map_err(ClientIoUring)?;
+
+        let write = match proxy.check_write() {
+            Ok(n) => buf.len().min(n).min(SIZE),
+            Err(wasmtime_wasi::StreamError::Closed) => break,
+            Err(_err) => unreachable!(),
+        };
+
+        if write == 0 {
+            match proxy.write_ready().await {
+                Ok(_) => {}
+                Err(wasmtime_wasi::StreamError::Closed) => break,
+                Err(_err) => panic!(),
+            }
+
+            continue;
+        }
+
+        let bytes = bytes::Bytes::copy_from_slice(&buf[..write]);
+        match proxy.write(bytes) {
+            Ok(()) => {}
+            Err(wasmtime_wasi::StreamError::Closed) => break,
+            Err(_err) => panic!(),
+        };
+    }
 
     Ok(())
 }

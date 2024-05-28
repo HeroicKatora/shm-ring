@@ -245,7 +245,7 @@ impl OutputRing {
                 let flush = Self::fill_stream(&hdl, range, &mut guard, &ring);
 
                 if flush > 0 {
-                    todo!();
+                    todo!("Signal and await until the current head has been read");
                 }
 
                 if sequence != released {
@@ -257,6 +257,8 @@ impl OutputRing {
 
                     produce.sync();
                 }
+
+                tokio::task::yield_now().await;
             }
         });
 
