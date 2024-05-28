@@ -121,9 +121,11 @@ impl InputRing {
                 // Permit is restored by the consumer of these bytes.
                 permit.forget();
 
-                let mut guard = hdl.buffer.lock().unwrap();
-                let range = (&mut sequence)..(&mut available.0);
-                Self::consume_stream(&hdl, range, &mut guard, &ring);
+                {
+                    let mut guard = hdl.buffer.lock().unwrap();
+                    let range = (&mut sequence)..(&mut available.0);
+                    Self::consume_stream(&hdl, range, &mut guard, &ring);
+                }
 
                 // Acknowledge the receipt, free buffer space.
                 if sequence != released {
@@ -226,6 +228,7 @@ impl OutputRing {
             loop {
                 // 1. wait for data having been produced.
                 more_data.await;
+                eprintln!("More data");
 
                 let mut reap = ring.consumer::<8>().unwrap();
 
@@ -238,14 +241,18 @@ impl OutputRing {
                 reap.sync();
 
                 // Re-arm the notify while holding the guard, ensure nothing is lost.
-                let mut guard = hdl.buffer.lock().unwrap();
-                more_data = hdl.notify_produced.notified();
+                let num_flush_requests = {
+                    let mut guard = hdl.buffer.lock().unwrap();
+                    more_data = hdl.notify_produced.notified();
 
-                let range = (&mut sequence)..(&mut available.0);
-                let flush = Self::fill_stream(&hdl, range, &mut guard, &ring);
+                    let range = (&mut sequence)..(&mut available.0);
+                    Self::fill_stream(&hdl, range, &mut guard, &ring)
+                };
 
-                if flush > 0 {
+                if num_flush_requests > 0 {
                     todo!("Signal and await until the current head has been read");
+                    hdl.flushed.fetch_add(num_flush_requests, atomic::Ordering::Release);
+                    hdl.notify_produced.notify_waiters();
                 }
 
                 if sequence != released {
@@ -258,6 +265,7 @@ impl OutputRing {
                     produce.sync();
                 }
 
+                eprintln!("More data pushed");
                 tokio::task::yield_now().await;
             }
         });
@@ -315,8 +323,12 @@ impl HostOutputStream for OutputRing {
             return Ok(());
         }
 
-        let mut guard = self.inner.buffer.lock().unwrap();
-        guard.push_back(bytes);
+        {
+            let mut guard = self.inner.buffer.lock().unwrap();
+            guard.push_back(bytes);
+        }
+
+        self.inner.notify_produced.notify_waiters();
         Ok(())
     }
 
@@ -325,9 +337,12 @@ impl HostOutputStream for OutputRing {
             .flush_level
             .fetch_add(1, atomic::Ordering::Relaxed);
 
-        let mut guard = self.inner.buffer.lock().unwrap();
-        guard.push_back(Bytes::default());
+        {
+            let mut guard = self.inner.buffer.lock().unwrap();
+            guard.push_back(Bytes::default());
+        }
 
+        self.inner.notify_produced.notify_waiters();
         Ok(())
     }
 

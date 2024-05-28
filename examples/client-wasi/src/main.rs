@@ -141,6 +141,7 @@ fn main() -> Result<(), Error> {
 
     let mut config = wasmtime::Config::new();
     config.async_support(true);
+    config.consume_fuel(true);
     let engine = wasmtime::Engine::new(&config)?;
 
     let program = new_program(&engine, &mod_options, &client, tid, opt_path.to_path_buf())?;
@@ -157,10 +158,12 @@ fn main() -> Result<(), Error> {
         let uring = ShmIoUring::new(&shared).map_err(ClientIoUring)?;
         let uring = sync::Arc::new(uring);
 
-        tokio::try_join!(
-            communicate_host(uring.clone(), host, &local),
-            communicate(uring.clone(), program, &local),
-        )?;
+        let host = communicate_host(uring.clone(), host, &local);
+        let client = communicate(uring.clone(), program, &local);
+
+        local
+            .run_until(async move { tokio::try_join!(host, client,) })
+            .await?;
 
         Ok::<_, ClientRunError>(())
     })?;
@@ -272,6 +275,11 @@ async fn communicate(
         .await?;
 
     let main = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+
+    const FUEL: u64 = 1 << 12;
+    store.fuel_async_yield_interval(Some(FUEL))?;
+    store.set_fuel(u64::MAX)?;
+
     main.call_async(&mut store, ()).await?;
 
     Ok(())
@@ -340,6 +348,10 @@ async fn move_stdin(
             Err(wasmtime_wasi::StreamError::Closed) => break,
             Err(_err) => panic!(),
         };
+
+        eprintln!("Written {} bytes", write);
+        stdin.consume(write);
+        tokio::task::yield_now().await;
     }
 
     Ok(())
