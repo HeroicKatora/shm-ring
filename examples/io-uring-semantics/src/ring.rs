@@ -42,8 +42,7 @@ pub(crate) struct TestCloseRing {
 }
 
 impl TestCloseRing {
-    pub fn new() -> Result<Self, std::io::Error> {
-        let mut io_uring = IoUring::new(0x100)?;
+    pub fn new(mut io_uring: IoUring) -> Result<Self, std::io::Error> {
         let fill = io_uring.submission().capacity();
 
         let eventfd = uapi::eventfd(
@@ -144,6 +143,14 @@ impl TestCloseRing {
             n,
             timeout: self.stable_timeouts.borrow_mut(),
         })
+    }
+
+    pub fn submit_all(&self) -> std::io::Result<usize> {
+        let mut ring = self.io_uring.borrow_mut();
+        let n = Self::submit(&mut ring, &self.stable_timeouts)?;
+        // Refill permits available for the fill queue.
+        self.fill.add_permits(n);
+        Ok(n)
     }
 
     /// Drive forward our submission towards the kernel, in the process of ensuring that the
