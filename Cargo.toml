@@ -72,3 +72,6 @@ members = [
   "examples/io-uring-semantics/vendor",
   "xtask/cbindgen",
 ]
+
+[patch.crates-io]
+io-uring = { path = "vendor/io-uring" }
