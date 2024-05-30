@@ -1,0 +1,11 @@
+[package]
+name = "io-uring-semantics-vendor"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "io-uring-semantics-vendor"
+path = "../src/main.rs"
+
+[dependencies]
+io-uring = { version = "0.6" }
