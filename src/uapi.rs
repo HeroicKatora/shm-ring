@@ -44,6 +44,10 @@ impl data::ClientIdentifier {
 }
 
 impl OwnedFd {
+    pub fn raw(&self) -> std::os::fd::RawFd {
+        self.0.raw()
+    }
+
     pub fn into_async(self) -> Result<AsyncFd<uapi::OwnedFd>, std::io::Error> {
         AsyncFd::new(self.0)
     }

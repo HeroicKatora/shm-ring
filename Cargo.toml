@@ -69,8 +69,8 @@ members = [
   "examples/client-wasi",
   "examples/fizz-buzz",
   "examples/io-uring-semantics",
-  "examples/io-uring-semantics/vendor",
   "xtask/cbindgen",
+  "vendor/io-uring",
 ]
 
 [patch.crates-io]

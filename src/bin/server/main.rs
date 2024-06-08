@@ -10,6 +10,10 @@ use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
 use tempfile::NamedTempFile;
+use tokio::{
+    io::{unix::AsyncFd, Interest},
+    task::JoinSet,
+};
 
 #[derive(Deserialize)]
 struct Options {
@@ -174,19 +178,48 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
     let server = unsafe { shared.into_server(ServerConfig { vec: &rings }) }?;
     let mut task = ServerTask::default();
 
-    loop {
-        let waiter = uring
-            .wait_server(&server, duration)
-            .await
-            .map_err(ServeIoUring)?;
-        let _ = waiter;
+    let mut tasks: JoinSet<Result<_, ServerServeError>> = JoinSet::new();
+    let (reap_send, mut reaper) = tokio::sync::mpsc::channel(0x1);
 
-        server.collect_fds(&mut task);
-        if server.bring_up(&rings) > 0 {
-            eprintln!("Reaped some clients");
+    loop {
+        tokio::select! {
+            waiter = uring.wait_server(&server, duration) => {
+                let _ = waiter.map_err(ServeIoUring)?;
+            }
+            client = reaper.recv() => {
+                let Some(client) = client else {
+                    break;
+                };
+
+                eprintln!("Reaping dead client");
+                server.reap_client(&mut task, client);
+            }
+        }
+
+        for client in server.track_clients(&mut task) {
+            let reap_send = reap_send.clone();
+
+            tasks.spawn(async move {
+                let died =
+                    AsyncFd::with_interest(client, Interest::READABLE).map_err(ServeIoUring)?;
+
+                died.readable().await.map_err(ServeIoUring)?.clear_ready();
+                let _ = reap_send.send(died.into_inner()).await;
+
+                Ok(())
+            });
+        }
+
+        match server.bring_up(&rings) {
+            0 => {}
+            n @ 1.. => {
+                eprintln!("Reinitialized {} client slots", n);
+            }
         }
 
         std::hint::spin_loop();
         std::thread::yield_now();
     }
+
+    Ok(())
 }

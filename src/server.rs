@@ -66,25 +66,60 @@ pub struct RingConfig {
     pub lhs: i32,
 }
 
+#[derive(Clone)]
+pub struct TrackedClient {
+    pid_fd: Arc<uapi::OwnedFd>,
+    client: data::ClientIdentifier,
+}
+
 impl Server {
     const PAGE_SIZE: u64 = 4096;
 
     /// Walk the ring info block, collecting PID file descriptors where necessary. It is the job of
     /// the server to, eventually, deactivate the slot entries of crashed processes.
-    pub fn collect_fds(&self, track: &mut ServerTask) -> Vec<Arc<uapi::OwnedFd>> {
+    pub fn track_clients(&self, track: &mut ServerTask) -> Vec<TrackedClient> {
         let mut count = vec![];
 
         for (idx, info) in self.server.info.into_iter().enumerate() {
             if let Ok(client) = info.lhs.inspect() {
-                count.extend(track.track_client(client, idx, data::ClientSide::Left));
+                let added = track.track_client(client, idx, data::ClientSide::Left);
+                count.extend(added.map(|pid_fd| TrackedClient { pid_fd, client }))
             }
 
             if let Ok(client) = info.rhs.inspect() {
-                count.extend(track.track_client(client, idx, data::ClientSide::Right));
+                let added = track.track_client(client, idx, data::ClientSide::Right);
+                count.extend(added.map(|pid_fd| TrackedClient { pid_fd, client }));
             }
         }
 
         count
+    }
+
+    pub fn reap_client(&self, server: &mut ServerTask, tracker: TrackedClient) {
+        let Some(client_data) = server.tracker.remove(&tracker.client) else {
+            return;
+        };
+
+        assert!(
+            Arc::ptr_eq(&client_data.pid, &tracker.pid_fd),
+            "Being lied to about the client"
+        );
+
+        for (idx, side) in client_data.rings {
+            let Some(ring) = self.server.info.get(data::RingIndex(idx)) else {
+                // Weird, but okay. Let's not crash on it..
+                continue;
+            };
+
+            let client = ring.select_slot(side);
+
+            // FIXME: should pull down the lock?
+            match client.leave(tracker.client) {
+                Ok(()) => {},
+                // Weird as well but okay. Already left.
+                Err(_) => {},
+            }
+        }
     }
 
     /// Initialize a server, if the configuration checks out.
@@ -299,5 +334,11 @@ impl RingVersion {
 impl Default for RingVersion {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::os::fd::AsRawFd for TrackedClient {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.pid_fd.as_ref().raw()
     }
 }
