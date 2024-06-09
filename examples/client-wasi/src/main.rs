@@ -181,11 +181,13 @@ fn new_program(
     let WasmModule::WasiV1 {
         module,
         stdin,
-        stdout: _,
-        stderr: _,
+        stdout,
+        stderr,
     } = &options;
 
     let stdin = join_ring(stdin.as_ref(), client, tid)?;
+    let stdout = join_ring(stdout.as_ref(), client, tid)?;
+    let stderr = join_ring(stderr.as_ref(), client, tid)?;
 
     let module = opt_path.join(module);
     let module = module.canonicalize()?;
@@ -197,8 +199,8 @@ fn new_program(
         module,
         engine: engine.clone(),
         stdin,
-        stdout: None,
-        stderr: None,
+        stdout,
+        stderr,
     })
 }
 
@@ -234,8 +236,22 @@ struct Stdin {
     inner: stream::InputRing,
 }
 
+struct Stdout {
+    inner: stream::OutputRing,
+}
+
 impl wasmtime_wasi::StdinStream for Stdin {
     fn stream(&self) -> Box<dyn wasmtime_wasi::HostInputStream> {
+        Box::new(self.inner.clone())
+    }
+
+    fn isatty(&self) -> bool {
+        false
+    }
+}
+
+impl wasmtime_wasi::StdoutStream for Stdout {
+    fn stream(&self) -> Box<dyn wasmtime_wasi::HostOutputStream> {
         Box::new(self.inner.clone())
     }
 
@@ -259,6 +275,22 @@ async fn communicate(
                 };
 
                 ctx.stdin(stdin);
+            }
+
+            if let Some(stdout) = program.stdout {
+                let stdout = Stdout {
+                    inner: stream::OutputRing::new(stdout, uring.clone(), &local),
+                };
+
+                ctx.stdout(stdout);
+            }
+
+            if let Some(stderr) = program.stderr {
+                let stderr = Stdout {
+                    inner: stream::OutputRing::new(stderr, uring.clone(), &local),
+                };
+
+                ctx.stderr(stderr);
             }
 
             ctx.build_p1()

@@ -9,6 +9,14 @@
       "data_size": 4096,
       "lhs_id": -1,
       "rhs_id": -1
+    },
+    {
+      "version": 1,
+      "ring_size": 1024,
+      "slot_entry_size": 8,
+      "data_size": 4096,
+      "lhs_id": -1,
+      "rhs_id": -1
     }
   ]
 }

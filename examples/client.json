@@ -2,7 +2,15 @@
 	"modules": [
 		{
 			"WasiV1": {
-				"module": "../target/wasm32-wasip1/release/fizz-buzz.wasm"
+				"module": "../target/wasm32-wasip1/release/fizz-buzz.wasm",
+				"stdin": {
+					"index": 0,
+					"side": "left"
+				},
+				"stdout": {
+					"index": 1,
+					"side": "right"
+				}
 			}
 		}
 	],
@@ -11,7 +19,7 @@
 		"side": "right"
 	},
 	"stdout": {
-		"index": 0,
+		"index": 1,
 		"side": "left"
 	}
 }

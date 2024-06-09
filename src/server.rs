@@ -83,12 +83,12 @@ impl Server {
         for (idx, info) in self.server.info.into_iter().enumerate() {
             if let Ok(client) = info.lhs.inspect() {
                 let added = track.track_client(client, idx, data::ClientSide::Left);
-                count.extend(added.map(|pid_fd| TrackedClient { pid_fd, client }))
+                count.extend(added)
             }
 
             if let Ok(client) = info.rhs.inspect() {
                 let added = track.track_client(client, idx, data::ClientSide::Right);
-                count.extend(added.map(|pid_fd| TrackedClient { pid_fd, client }));
+                count.extend(added);
             }
         }
 
@@ -104,6 +104,8 @@ impl Server {
             Arc::ptr_eq(&client_data.pid, &tracker.pid_fd),
             "Being lied to about the client"
         );
+
+        eprintln!("Removing a client with {} ring entries", client_data.rings.len());
 
         for (idx, side) in client_data.rings {
             let Some(ring) = self.server.info.get(data::RingIndex(idx)) else {
@@ -317,22 +319,22 @@ impl ServerTask {
         client: data::ClientIdentifier,
         idx: usize,
         side: data::ClientSide,
-    ) -> Option<Arc<uapi::OwnedFd>> {
-        let pid;
+    ) -> Option<TrackedClient> {
+        let pid_fd;
         let entry = match self.tracker.entry(client) {
             hash_map::Entry::Occupied(entry) => {
-                pid = None;
+                pid_fd = None;
                 entry.into_mut()
             }
             hash_map::Entry::Vacant(entry) => {
-                // We're not going to track this client if we can't open its pid. Likely already
+                // We're not going to track this client if we can't open its pid_fd. Likely already
                 // recycled.
                 let Ok(new_pid) = client.open_pid() else {
                     return None;
                 };
 
                 let new_pid = Arc::new(new_pid);
-                pid = Some(new_pid.clone());
+                pid_fd = Some(new_pid.clone());
                 entry.insert(ClientTrackingData {
                     pid: new_pid,
                     rings: HashSet::new(),
@@ -341,7 +343,7 @@ impl ServerTask {
         };
 
         entry.rings.insert((idx, side));
-        pid
+        pid_fd.map(|pid_fd| TrackedClient { pid_fd, client })
     }
 }
 
