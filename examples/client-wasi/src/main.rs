@@ -349,7 +349,6 @@ async fn move_stdin(
             Err(_err) => panic!(),
         };
 
-        eprintln!("Written {} bytes", write);
         stdin.consume(write);
         tokio::task::yield_now().await;
     }

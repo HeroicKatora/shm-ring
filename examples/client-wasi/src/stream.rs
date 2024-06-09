@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use shm_pbx::client::Ring;
+use shm_pbx::client::{Ring, WaitResult};
 use shm_pbx::io_uring::ShmIoUring;
 use tokio::sync::{Notify, Semaphore};
 use wasmtime_wasi::{HostInputStream, HostOutputStream, StreamResult, Subscribe};
@@ -29,6 +29,7 @@ pub struct OutputRing {
 
 struct OutputInner {
     notify_produced: Notify,
+    notify_flushed: Notify,
     buffer: Mutex<VecDeque<Bytes>>,
     flush_level: atomic::AtomicUsize,
     flushed: atomic::AtomicUsize,
@@ -102,10 +103,11 @@ impl InputRing {
             let mut head_receive = 0;
 
             loop {
-                // 1. wait for space on the queue.
+                // 1. wait for space on the queue. FIXME: potentially losing the last message. At
+                //    `RemoteInactive` we break before having cleaned up. Should fence post with a
+                //    last consumer and consume_stream round.
                 let Ok(permit) = hdl.notify_consumed.acquire().await else {
-                    // Closed.
-                    break;
+                    break Ok(());
                 };
 
                 // 2. wait for messages on the ring.
@@ -118,13 +120,19 @@ impl InputRing {
                 );
 
                 reap.sync();
-                // Permit is restored by the consumer of these bytes.
-                permit.forget();
 
                 {
                     let mut guard = hdl.buffer.lock().unwrap();
                     let range = (&mut sequence)..(&mut available.0);
-                    Self::consume_stream(&hdl, range, &mut guard, &ring);
+                    let data = Self::consume_stream(&hdl, range, &ring);
+
+                    if !data.is_empty() {
+                        guard.push_back(data);
+
+                        hdl.notify_produced.notify_waiters();
+                        // Permit is restored by the consumer of these bytes.
+                        permit.forget();
+                    }
                 }
 
                 // Acknowledge the receipt, free buffer space.
@@ -138,19 +146,32 @@ impl InputRing {
                     produce.sync();
                 }
 
-                on.wait_for_message(&ring, head_receive, recheck_time).await;
+                let wait = match on.wait_for_message(&ring, head_receive, recheck_time).await {
+                    Err(io) => break Err(io),
+                    Ok(wait) => wait,
+                };
+
+                match wait {
+                    // We successfully waited, or the other half had concurrently advanced anyways
+                    WaitResult::Ok | WaitResult::PreconditionFailed => {}
+                    // Also alright, nothing fatal and just retry. Could handle blocked a bit
+                    // nicer.
+                    WaitResult::RemoteBlocked | WaitResult::Restart | WaitResult::Timeout => {}
+                    // The remote is no longer here stop.
+                    WaitResult::RemoteInactive => {
+                        eprintln!("Remote half left the ring");
+                        hdl.notify_consumed.close();
+                        continue;
+                    }
+                    WaitResult::Error => unreachable!(""),
+                }
             }
         });
 
         InputRing { inner }
     }
 
-    fn consume_stream(
-        inner: &InputInner,
-        available: Range<&mut u64>,
-        full: &mut VecDeque<Bytes>,
-        ring: &Ring,
-    ) {
+    fn consume_stream(inner: &InputInner, available: Range<&mut u64>, ring: &Ring) -> Bytes {
         // In case we want to a maximum size on each Bytes, just min this.
         let (range, start_offset) = split_ring(&available, inner.buffer_space_size);
         let (first_size, size) = (range.start, range.end);
@@ -159,8 +180,8 @@ impl InputRing {
         unsafe { ring.copy_from(&mut target[..first_size as usize], start_offset) };
         unsafe { ring.copy_from(&mut target[first_size as usize..], 0) };
 
-        full.push_back(target.into());
         *available.start = *available.end;
+        target.into()
     }
 }
 
@@ -207,6 +228,7 @@ impl OutputRing {
 
         let inner = Arc::new(OutputInner {
             notify_produced: Notify::new(),
+            notify_flushed: Notify::new(),
             buffer: Mutex::default(),
             flush_level: 0.into(),
             flushed: 0.into(),
@@ -221,14 +243,16 @@ impl OutputRing {
         local.spawn_local(async move {
             let mut more_data = hdl.notify_produced.notified();
             let mut available = Available(buffer_space_size);
+
             let mut sequence = 0u64;
             let mut released = 0u64;
             let mut head_receive = 0;
 
+            let mut outstanding_flush = 0;
+
             loop {
                 // 1. wait for data having been produced.
                 more_data.await;
-                eprintln!("More data");
 
                 let mut reap = ring.consumer::<8>().unwrap();
 
@@ -241,21 +265,25 @@ impl OutputRing {
 
                 reap.sync();
 
-                // Re-arm the notify while holding the guard, ensure nothing is lost.
-                let num_flush_requests = {
+                // Write more data if we're not instructed to flush.
+                outstanding_flush = if outstanding_flush == 0 {
+                    // Re-arm the notify while holding the guard, ensure nothing is lost.
                     let mut guard = hdl.buffer.lock().unwrap();
                     more_data = hdl.notify_produced.notified();
-
                     let range = (&mut sequence)..(&mut available.0);
                     Self::fill_stream(&hdl, range, &mut guard, &ring)
-                };
-
-                if num_flush_requests > 0 {
-                    todo!("Signal and await until the current head has been read");
+                // If we've successfully flushed, tell the writer.
+                } else if released.saturating_add(buffer_space_size) == available.0 {
                     hdl.flushed
-                        .fetch_add(num_flush_requests, atomic::Ordering::Release);
-                    hdl.notify_produced.notify_waiters();
-                }
+                        .fetch_add(outstanding_flush, atomic::Ordering::Release);
+                    hdl.notify_flushed.notify_waiters();
+
+                    more_data = hdl.notify_produced.notified();
+                    0
+                } else {
+                    more_data = hdl.notify_produced.notified();
+                    outstanding_flush
+                };
 
                 if sequence != released {
                     let mut produce = ring.producer::<8>().unwrap();
@@ -267,7 +295,6 @@ impl OutputRing {
                     produce.sync();
                 }
 
-                eprintln!("More data pushed {released}/{sequence} released");
                 tokio::task::yield_now().await;
             }
         });
@@ -306,7 +333,6 @@ impl OutputRing {
 
             unsafe { ring.copy_to(&first, start_offset) };
             unsafe { ring.copy_to(&second, 0) };
-            eprintln!("Copied {copy_size} more data");
             *available.start += copy_size as u64;
 
             if free_space < copy_size {
@@ -369,7 +395,7 @@ impl Subscribe for OutputRing {
 
         loop {
             // Make sure we progress if anything may have changed.
-            let notify = self.inner.notify_produced.notified();
+            let notify = self.inner.notify_flushed.notified();
             let flushed = self.inner.flushed.load(atomic::Ordering::Acquire);
 
             if flushed >= flush {
