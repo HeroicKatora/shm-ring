@@ -71,7 +71,7 @@ fn split_ring(available: &Range<&mut u64>, buffer_space_size: u64) -> (Range<usi
     // In case we want to a maximum size on each Bytes, just min this.
     let size = (*available.end).checked_sub(*available.start).unwrap();
 
-    assert!(size <= buffer_space_size);
+    assert!(size <= buffer_space_size, "{available:?}");
     let first_capacity = buffer_space_size - start_offset;
 
     let second_size = size.saturating_sub(first_capacity);
@@ -220,7 +220,7 @@ impl OutputRing {
 
         local.spawn_local(async move {
             let mut more_data = hdl.notify_produced.notified();
-            let mut available = Available(0u64);
+            let mut available = Available(buffer_space_size);
             let mut sequence = 0u64;
             let mut released = 0u64;
             let mut head_receive = 0;
@@ -235,6 +235,7 @@ impl OutputRing {
                 available.extend(
                     reap.iter()
                         .map(u64::from_le_bytes)
+                        .map(|n| n.saturating_add(buffer_space_size))
                         .inspect(|_| head_receive += 1),
                 );
 
@@ -251,7 +252,8 @@ impl OutputRing {
 
                 if num_flush_requests > 0 {
                     todo!("Signal and await until the current head has been read");
-                    hdl.flushed.fetch_add(num_flush_requests, atomic::Ordering::Release);
+                    hdl.flushed
+                        .fetch_add(num_flush_requests, atomic::Ordering::Release);
                     hdl.notify_produced.notify_waiters();
                 }
 
@@ -265,7 +267,7 @@ impl OutputRing {
                     produce.sync();
                 }
 
-                eprintln!("More data pushed");
+                eprintln!("More data pushed {released}/{sequence} released");
                 tokio::task::yield_now().await;
             }
         });
@@ -297,16 +299,18 @@ impl OutputRing {
             let (first_size, free_space) = (range.start, range.end);
 
             let split = frame.len().min(first_size);
-            let size = frame.len().min(free_space);
+            let copy_size = frame.len().min(free_space);
 
-            let first = frame.split_off(split);
-            let second = frame.split_off(size - first_size);
+            let first = frame.split_to(split);
+            let second = frame.split_to(copy_size - split);
 
             unsafe { ring.copy_to(&first, start_offset) };
             unsafe { ring.copy_to(&second, 0) };
-            *available.start *= size as u64;
+            eprintln!("Copied {copy_size} more data");
+            *available.start += copy_size as u64;
 
-            if free_space < size {
+            if free_space < copy_size {
+                // Still some data left to write.
                 break;
             }
 

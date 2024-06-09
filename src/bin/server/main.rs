@@ -4,7 +4,9 @@ use std::{fs, path::PathBuf};
 
 use shm_pbx::frame::Shared;
 use shm_pbx::io_uring::ShmIoUring;
-use shm_pbx::server::{RingConfig, RingVersion, ServerConfig, ServerError, ServerTask};
+use shm_pbx::server::{
+    RingConfig, RingVersion, ServerConfig, ServerError, ServerTask, TrackedClient,
+};
 
 use memmap2::MmapRaw;
 use quick_error::quick_error;
@@ -179,7 +181,7 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
     let mut task = ServerTask::default();
 
     let mut tasks: JoinSet<Result<_, ServerServeError>> = JoinSet::new();
-    let (reap_send, mut reaper) = tokio::sync::mpsc::channel(0x1);
+    let (reap_send, mut reaper) = tokio::sync::mpsc::channel::<TrackedClient>(0x1);
 
     loop {
         tokio::select! {
@@ -191,7 +193,7 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
                     break;
                 };
 
-                eprintln!("Reaping dead client");
+                eprintln!("Reaped dead client pid {:?}", client.identifier());
                 server.reap_client(&mut task, client);
             }
         }
@@ -213,7 +215,7 @@ async fn serve_map_in(shared: Shared, options: Options) -> Result<(), ServerServ
         match server.bring_up(&rings) {
             0 => {}
             n @ 1.. => {
-                eprintln!("Reinitialized {} client slots", n);
+                eprintln!("Reinitialized {} ring pair", n);
             }
         }
 

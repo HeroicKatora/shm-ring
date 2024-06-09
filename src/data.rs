@@ -322,6 +322,19 @@ impl ClientSlot {
         }
     }
 
+    /// Check if the server is the authority to write to this slot, i.e. if it is `0`.
+    ///
+    /// On `true`, the server is the only one allowed to turn it false thus this is also a
+    /// non-ephemeral answer. After `true` the server can rely on all effects having been seen.
+    pub(crate) fn is_owned_by_server_as_checked_by_server(&self) -> bool {
+        if self.owner.load(Ordering::Relaxed) == 0 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn reinit(&self, ring: RingIdentifier) -> Result<(), Option<ClientIdentifier>> {
         let token: i32 = ring.0;
         assert!(token < 0, "Invalid client ID");
@@ -429,6 +442,25 @@ impl RingHead {
             ClientSide::Left => &self.lhs.send_indicator,
             ClientSide::Right => &self.rhs.send_indicator,
         }
+    }
+
+    pub(crate) fn reinit_holding_as_server(&self) {
+        self.select_consumer(ClientSide::Left)
+            .store(0, Ordering::Relaxed);
+        self.select_consumer(ClientSide::Right)
+            .store(0, Ordering::Relaxed);
+
+        self.select_producer(ClientSide::Left)
+            .store(0, Ordering::Relaxed);
+        self.select_producer(ClientSide::Right)
+            .store(0, Ordering::Relaxed);
+
+        self.send_indicator(ClientSide::Left)
+            .store(0, Ordering::Relaxed);
+        self.send_indicator(ClientSide::Right)
+            .store(0, Ordering::Relaxed);
+
+        self.blocked.0.store(0, Ordering::Relaxed);
     }
 }
 

@@ -115,9 +115,9 @@ impl Server {
 
             // FIXME: should pull down the lock?
             match client.leave(tracker.client) {
-                Ok(()) => {},
+                Ok(()) => {}
                 // Weird as well but okay. Already left.
-                Err(_) => {},
+                Err(_) => {}
             }
         }
     }
@@ -191,13 +191,24 @@ impl Server {
         let mut success = 0;
 
         for (slot, ids) in self.server.info.into_iter().zip(ids) {
-            if let Some(id) = data::RingIdentifier::new(ids.rhs) {
-                success += usize::from(slot.rhs.reinit(id).is_ok());
+            let Some(rhs) = data::RingIdentifier::new(ids.rhs) else {
+                continue;
+            };
+
+            let Some(lhs) = data::RingIdentifier::new(ids.lhs) else {
+                continue;
+            };
+
+            if !slot.lhs.is_owned_by_server_as_checked_by_server()
+                || !slot.rhs.is_owned_by_server_as_checked_by_server()
+            {
+                continue;
             }
 
-            if let Some(id) = data::RingIdentifier::new(ids.lhs) {
-                success += usize::from(slot.lhs.reinit(id).is_ok());
-            }
+            let ring_head = self.borrow_ring_head(slot);
+            ring_head.reinit_holding_as_server();
+
+            success += usize::from(slot.lhs.reinit(lhs).is_ok() && slot.rhs.reinit(rhs).is_ok());
         }
 
         success
@@ -209,6 +220,15 @@ impl Server {
 
     pub(crate) fn head(&self) -> &data::ShmHead {
         &self.server.head
+    }
+
+    fn borrow_ring_head(&self, slot: &data::RingInfo) -> &data::RingHead {
+        let head_ptr = self
+            .ring
+            .get_aligned_data_at_offset::<data::RingHead>(slot.offset_head)
+            .unwrap();
+        // Safety: only borrowing it for the lifetime of `self` which protects the mapping.
+        unsafe { &*head_ptr }
     }
 
     fn offsets(
@@ -334,6 +354,12 @@ impl RingVersion {
 impl Default for RingVersion {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl TrackedClient {
+    pub fn identifier(&self) -> data::ClientIdentifier {
+        self.client
     }
 }
 
