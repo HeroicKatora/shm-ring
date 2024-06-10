@@ -150,6 +150,7 @@ fn main() -> Result<(), Error> {
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
+        .enable_time()
         .build()?;
 
     rt.block_on(async {
@@ -271,6 +272,9 @@ async fn communicate(
 
             if let Some(stdin) = program.stdin {
                 let stdin = Stdin {
+                    #[cfg(debug_assertions)]
+                    inner: stream::InputRing::new(stdin, uring.clone(), &local).with_name(0),
+                    #[cfg(not(debug_assertions))]
                     inner: stream::InputRing::new(stdin, uring.clone(), &local),
                 };
 
@@ -279,6 +283,9 @@ async fn communicate(
 
             if let Some(stdout) = program.stdout {
                 let stdout = Stdout {
+                    #[cfg(debug_assertions)]
+                    inner: stream::OutputRing::new(stdout, uring.clone(), &local).with_name(1),
+                    #[cfg(not(debug_assertions))]
                     inner: stream::OutputRing::new(stdout, uring.clone(), &local),
                 };
 

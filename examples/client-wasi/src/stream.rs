@@ -13,6 +13,7 @@ use wasmtime_wasi::{HostInputStream, HostOutputStream, StreamResult, Subscribe};
 #[derive(Clone)]
 pub struct InputRing {
     inner: Arc<InputInner>,
+    name: Option<u64>,
 }
 
 struct InputInner {
@@ -25,6 +26,7 @@ struct InputInner {
 #[derive(Clone)]
 pub struct OutputRing {
     inner: Arc<OutputInner>,
+    name: Option<u64>,
 }
 
 struct OutputInner {
@@ -168,7 +170,11 @@ impl InputRing {
             }
         });
 
-        InputRing { inner }
+        InputRing { inner, name: None }
+    }
+
+    pub fn with_name(self, name: u64) -> Self {
+        InputRing { name: Some(name), ..self }
     }
 
     fn consume_stream(inner: &InputInner, available: Range<&mut u64>, ring: &Ring) -> Bytes {
@@ -188,6 +194,10 @@ impl InputRing {
 impl HostInputStream for InputRing {
     // Required method
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
+        if let Some(name) = self.name {
+            eprintln!("{name}: Read up to {size}");
+        }
+
         let mut guard = self.inner.buffer.lock().unwrap();
         let Some(bytes) = guard.front_mut() else {
             return Ok(Bytes::default());
@@ -208,6 +218,10 @@ impl HostInputStream for InputRing {
 #[wasmtime_wasi::async_trait]
 impl Subscribe for InputRing {
     async fn ready(&mut self) {
+        if let Some(name) = self.name {
+            eprintln!("{name}: Wait");
+        }
+
         // We're ready to receive notifications after this point.
         let wakeup = self.inner.notify_produced.notified();
 
@@ -249,10 +263,16 @@ impl OutputRing {
             let mut head_receive = 0;
 
             let mut outstanding_flush = 0;
+            let mut recheck = tokio::time::interval(recheck_time);
 
             loop {
                 // 1. wait for data having been produced.
-                more_data.await;
+                tokio::select! {
+                    _ = more_data => {},
+                    // FIXME: when we flush, we wait this tick time to find out if the remote has
+                    // accepted the data. This is quite wasteful.
+                    _ = recheck.tick() => {},
+                };
 
                 let mut reap = ring.consumer::<8>().unwrap();
 
@@ -299,7 +319,11 @@ impl OutputRing {
             }
         });
 
-        OutputRing { inner }
+        OutputRing { inner, name: None }
+    }
+
+    pub fn with_name(self, name: u64) -> Self {
+        OutputRing { name: Some(name), ..self }
     }
 
     #[must_use = "Flushes must be tracked"]
@@ -349,6 +373,10 @@ impl OutputRing {
 
 impl HostOutputStream for OutputRing {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        if let Some(name) = self.name {
+            eprintln!("{name}: Write {}", bytes.len());
+        }
+
         if bytes.is_empty() {
             return Ok(());
         }
@@ -363,6 +391,10 @@ impl HostOutputStream for OutputRing {
     }
 
     fn flush(&mut self) -> StreamResult<()> {
+        if let Some(name) = self.name {
+            eprintln!("{name}: Flush");
+        }
+
         self.inner
             .flush_level
             .fetch_add(1, atomic::Ordering::Relaxed);
@@ -380,6 +412,10 @@ impl HostOutputStream for OutputRing {
         let flush = self.inner.flush_level.load(atomic::Ordering::Acquire);
         let flushed = self.inner.flushed.load(atomic::Ordering::Acquire);
 
+        if let Some(name) = self.name {
+            eprintln!("{name}: Check write {}", flushed >= flush);
+        }
+
         if flushed >= flush {
             Ok(usize::MAX)
         } else {
@@ -391,12 +427,20 @@ impl HostOutputStream for OutputRing {
 #[wasmtime_wasi::async_trait]
 impl Subscribe for OutputRing {
     async fn ready(&mut self) {
+        if let Some(name) = self.name {
+            eprintln!("{name}: Ready");
+        }
+
         let flush = self.inner.flush_level.load(atomic::Ordering::Acquire);
 
         loop {
             // Make sure we progress if anything may have changed.
             let notify = self.inner.notify_flushed.notified();
             let flushed = self.inner.flushed.load(atomic::Ordering::Acquire);
+
+            if let Some(name) = self.name {
+                eprintln!("{name}: {} {}", flushed, flush);
+            }
 
             if flushed >= flush {
                 return;

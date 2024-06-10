@@ -8,14 +8,14 @@ pub fn main() -> Result<(), std::io::Error> {
     let stdin = stdin.lock();
     let mut stdout = stdout.lock();
 
-    for line in stdin.lines().take(1) {
+    for line in stdin.lines() {
         let Ok(line) = line else {
-            writeln!(&mut stdout, "")?;
+            writeln!(&mut stdout, "Error:IO")?;
             continue;
         };
 
         let Ok(num) = line.parse::<u64>() else {
-            writeln!(&mut stdout, "")?;
+            writeln!(&mut stdout, "Error:NUM")?;
             continue;
         };
 
