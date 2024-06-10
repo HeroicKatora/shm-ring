@@ -241,6 +241,12 @@ struct Stdout {
     inner: stream::OutputRing,
 }
 
+impl Drop for Stdout {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
 impl wasmtime_wasi::StdinStream for Stdin {
     fn stream(&self) -> Box<dyn wasmtime_wasi::HostInputStream> {
         Box::new(self.inner.clone())
@@ -365,6 +371,10 @@ async fn move_stdin(
     loop {
         let buf = stdin.fill_buf().await.map_err(ClientIoUring)?;
 
+        if buf.is_empty() {
+            break;
+        }
+
         let write = match proxy.check_write() {
             Ok(n) => buf.len().min(n).min(SIZE),
             Err(wasmtime_wasi::StreamError::Closed) => break,
@@ -392,6 +402,7 @@ async fn move_stdin(
         tokio::task::yield_now().await;
     }
 
+    proxy.close();
     Ok(())
 }
 

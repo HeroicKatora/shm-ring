@@ -8,7 +8,7 @@ use bytes::Bytes;
 use shm_pbx::client::{Ring, WaitResult};
 use shm_pbx::io_uring::ShmIoUring;
 use tokio::sync::{Notify, Semaphore};
-use wasmtime_wasi::{HostInputStream, HostOutputStream, StreamResult, Subscribe};
+use wasmtime_wasi::{HostInputStream, HostOutputStream, StreamError, StreamResult, Subscribe};
 
 #[derive(Clone)]
 pub struct InputRing {
@@ -19,8 +19,13 @@ pub struct InputRing {
 struct InputInner {
     notify_produced: Notify,
     notify_consumed: Semaphore,
-    buffer: Mutex<VecDeque<Bytes>>,
+    buffer: Mutex<VecDeque<BytesOrEof>>,
     buffer_space_size: u64,
+}
+
+enum BytesOrEof {
+    Some(Bytes),
+    Eof,
 }
 
 #[derive(Clone)]
@@ -32,19 +37,25 @@ pub struct OutputRing {
 struct OutputInner {
     notify_produced: Notify,
     notify_flushed: Notify,
-    buffer: Mutex<VecDeque<Bytes>>,
+    buffer: Mutex<VecDeque<BytesOrEof>>,
     flush_level: atomic::AtomicUsize,
     flushed: atomic::AtomicUsize,
     buffer_space_size: u64,
 }
 
-struct Available(u64);
+#[derive(Default)]
+struct Available {
+    head: u64,
+    /// Has EOF been signalled by sending the same seq twice.
+    eof: bool,
+}
 
 impl Extend<u64> for Available {
     fn extend<T: IntoIterator<Item = u64>>(&mut self, iter: T) {
         for item in iter {
-            assert!(self.0 <= item, "do not handle stream wrapping");
-            self.0 = item;
+            self.eof |= self.head == item;
+            assert!(self.head <= item, "do not handle stream wrapping");
+            self.head = item;
         }
     }
 }
@@ -89,7 +100,7 @@ impl InputRing {
         let inner = Arc::new(InputInner {
             notify_produced: Notify::new(),
             notify_consumed: Semaphore::const_new(32),
-            buffer: Mutex::default(),
+            buffer: Mutex::new(VecDeque::with_capacity(0x10)),
             buffer_space_size,
         });
 
@@ -99,7 +110,7 @@ impl InputRing {
         let hdl = inner.clone();
 
         let _task = local.spawn_local(async move {
-            let mut available = Available(0u64);
+            let mut available = Available::default();
             let mut sequence = 0u64;
             let mut released = 0u64;
             let mut head_receive = 0;
@@ -125,12 +136,21 @@ impl InputRing {
 
                 {
                     let mut guard = hdl.buffer.lock().unwrap();
-                    let range = (&mut sequence)..(&mut available.0);
+                    let range = (&mut sequence)..(&mut available.head);
                     let data = Self::consume_stream(&hdl, range, &ring);
 
-                    if !data.is_empty() {
-                        guard.push_back(data);
+                    let is_data = !data.is_empty();
+                    let is_eof = available.eof && sequence == available.head;
 
+                    if is_data {
+                        guard.push_back(BytesOrEof::Some(data));
+                    }
+
+                    if is_eof {
+                        guard.push_back(BytesOrEof::Eof);
+                    }
+
+                    if is_eof || is_data {
                         hdl.notify_produced.notify_waiters();
                         // Permit is restored by the consumer of these bytes.
                         permit.forget();
@@ -174,7 +194,10 @@ impl InputRing {
     }
 
     pub fn with_name(self, name: u64) -> Self {
-        InputRing { name: Some(name), ..self }
+        InputRing {
+            name: Some(name),
+            ..self
+        }
     }
 
     fn consume_stream(inner: &InputInner, available: Range<&mut u64>, ring: &Ring) -> Bytes {
@@ -199,8 +222,18 @@ impl HostInputStream for InputRing {
         }
 
         let mut guard = self.inner.buffer.lock().unwrap();
+
         let Some(bytes) = guard.front_mut() else {
             return Ok(Bytes::default());
+        };
+
+        let BytesOrEof::Some(bytes) = bytes else {
+            if let Some(name) = self.name {
+                eprintln!("{name}: Read from closed stream");
+            }
+
+            // The EOF marker is preserved. It's final.
+            return Err(StreamError::Closed);
         };
 
         let length = bytes.len().min(size);
@@ -243,7 +276,7 @@ impl OutputRing {
         let inner = Arc::new(OutputInner {
             notify_produced: Notify::new(),
             notify_flushed: Notify::new(),
-            buffer: Mutex::default(),
+            buffer: Mutex::new(VecDeque::with_capacity(0x10)),
             flush_level: 0.into(),
             flushed: 0.into(),
             buffer_space_size,
@@ -256,7 +289,10 @@ impl OutputRing {
 
         local.spawn_local(async move {
             let mut more_data = hdl.notify_produced.notified();
-            let mut available = Available(buffer_space_size);
+            let mut available = Available {
+                head: buffer_space_size,
+                ..Available::default()
+            };
 
             let mut sequence = 0u64;
             let mut released = 0u64;
@@ -264,6 +300,9 @@ impl OutputRing {
 
             let mut outstanding_flush = 0;
             let mut recheck = tokio::time::interval(recheck_time);
+
+            let mut pending_eof = false;
+            let mut sent_eof = false;
 
             loop {
                 // 1. wait for data having been produced.
@@ -290,10 +329,17 @@ impl OutputRing {
                     // Re-arm the notify while holding the guard, ensure nothing is lost.
                     let mut guard = hdl.buffer.lock().unwrap();
                     more_data = hdl.notify_produced.notified();
-                    let range = (&mut sequence)..(&mut available.0);
-                    Self::fill_stream(&hdl, range, &mut guard, &ring)
+                    let range = (&mut sequence)..(&mut available.head);
+                    let new_flushes = Self::fill_stream(&hdl, range, &mut guard, &ring);
+
+                    let is_at_eof = guard
+                        .front()
+                        .map_or(false, |frame| matches!(frame, BytesOrEof::Eof));
+                    pending_eof |= is_at_eof;
+
+                    new_flushes
                 // If we've successfully flushed, tell the writer.
-                } else if released.saturating_add(buffer_space_size) == available.0 {
+                } else if released.saturating_add(buffer_space_size) == available.head {
                     hdl.flushed
                         .fetch_add(outstanding_flush, atomic::Ordering::Release);
                     hdl.notify_flushed.notify_waiters();
@@ -313,6 +359,16 @@ impl OutputRing {
                     }
 
                     produce.sync();
+                } else if pending_eof != sent_eof {
+                    // Double the previous sequence number, to indicate the EOF. This is similar to
+                    // producing a read of length `0` in a Unix API.
+                    let mut produce = ring.producer::<8>().unwrap();
+
+                    if produce.push_many([u64::to_le_bytes(sequence)]) > 0 {
+                        sent_eof = true;
+                    }
+
+                    produce.sync();
                 }
 
                 tokio::task::yield_now().await;
@@ -323,20 +379,34 @@ impl OutputRing {
     }
 
     pub fn with_name(self, name: u64) -> Self {
-        OutputRing { name: Some(name), ..self }
+        OutputRing {
+            name: Some(name),
+            ..self
+        }
+    }
+
+    pub fn close(&mut self) {
+        let mut guard = self.inner.buffer.lock().unwrap();
+        guard.push_back(BytesOrEof::Eof);
     }
 
     #[must_use = "Flushes must be tracked"]
     fn fill_stream(
         inner: &OutputInner,
         available: Range<&mut u64>,
-        full: &mut VecDeque<Bytes>,
+        full: &mut VecDeque<BytesOrEof>,
         ring: &Ring,
     ) -> usize {
         let mut flushes = 0;
 
         loop {
             let Some(frame) = full.front_mut() else {
+                break;
+            };
+
+            // Signals a closing flush.
+            let BytesOrEof::Some(frame) = frame else {
+                flushes += 1;
                 break;
             };
 
@@ -383,7 +453,7 @@ impl HostOutputStream for OutputRing {
 
         {
             let mut guard = self.inner.buffer.lock().unwrap();
-            guard.push_back(bytes);
+            guard.push_back(BytesOrEof::Some(bytes));
         }
 
         self.inner.notify_produced.notify_waiters();
@@ -401,7 +471,7 @@ impl HostOutputStream for OutputRing {
 
         {
             let mut guard = self.inner.buffer.lock().unwrap();
-            guard.push_back(Bytes::default());
+            guard.push_back(BytesOrEof::Some(Bytes::default()));
         }
 
         self.inner.notify_produced.notify_waiters();
