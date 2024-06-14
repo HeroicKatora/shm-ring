@@ -1,16 +1,15 @@
 mod stream;
 
-use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest, WaitResult};
+use shm_pbx::client::{Client, Ring, RingJoinError, RingRequest};
 use shm_pbx::data::{ClientIdentifier, ClientSide, RingIndex};
 use shm_pbx::frame::Shared;
 use shm_pbx::io_uring::ShmIoUring;
-use shm_pbx::server::{RingConfig, RingVersion, ServerConfig};
 
 use memmap2::MmapRaw;
 use quick_error::quick_error;
 use serde::Deserialize;
 use wasmtime::{Module, Store};
-use wasmtime_wasi::{preview1, ResourceTable, WasiCtx, WasiCtxBuilder};
+use wasmtime_wasi::{preview1, WasiCtxBuilder};
 
 use std::{fs, path::PathBuf, sync};
 
