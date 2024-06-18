@@ -47,10 +47,6 @@ impl OwnedFd {
     pub fn raw(&self) -> std::os::fd::RawFd {
         self.0.raw()
     }
-
-    pub fn into_async(self) -> Result<AsyncFd<uapi::OwnedFd>, std::io::Error> {
-        AsyncFd::new(self.0)
-    }
 }
 
 // FIXME: also useful in IO-uring. So move it out of this uapi feature file?
