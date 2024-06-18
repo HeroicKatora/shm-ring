@@ -86,7 +86,28 @@ fn create_server() {
         tid,
     });
 
-    assert!(join_rhs.is_err());
+    assert!(
+        join_rhs.is_err(),
+        "After dropping one side, the ring is not available"
+    );
+
+    // This recycles any rings completely empty.
+    server.bring_up(&rings);
+
+    let join_rhs = client.join(&RingRequest {
+        side: ClientSide::Right,
+        index: RingIndex(0),
+        tid,
+    });
+
+    assert!(
+        join_rhs.is_err(),
+        "After dropping one side, the ring is not immediately recycled"
+    );
+
+    drop(join_rhs);
+    drop(join_lhs);
+
     server.bring_up(&rings);
 
     let join_rhs = client.join(&RingRequest {

@@ -59,7 +59,10 @@ fn create_server() {
         // This unlock spuriously whenever the other side notifies us to check for new messages via
         // `wake`. While locked, they can check via a relaxed load whether the lock is taken.
         assert_eq!(guard.wake(Duration::from_millis(1_000)), WaitResult::Ok);
-        assert_eq!(rhs.activate(), 1);
+        // This is inherently racing with the `wait_for_remote` below. If we're in-time then the
+        // activation happens before it even waits then the wait_for_remote will fail with a
+        // `PreconditionFailed`.
+        assert!(rhs.activate() <= 1);
     });
 
     let lhs = join_lhs.unwrap();
