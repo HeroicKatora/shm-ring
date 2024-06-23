@@ -97,3 +97,94 @@ fn create_server() {
 
     let _ = { server };
 }
+
+/// We must be able to re-initialize rings if a client dies at a ring, but the remote has never
+/// been taken by another client.
+#[test]
+fn reap_at_one_sides() {
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(0x1_000_000).unwrap();
+
+    let map = MmapRaw::map_raw(&file).unwrap();
+    // Fulfills all the pre-conditions of alignment to map.
+    let shared = Shared::new(map).unwrap();
+
+    let rings = [RingConfig {
+        version: RingVersion::default(),
+        ring_size: 0x10,
+        data_size: 0x1234,
+        slot_entry_size: 0x8,
+        lhs: -1,
+        rhs: -1,
+    }];
+
+    let shared_server = shared.clone();
+    let server = unsafe { shared_server.into_server(ServerConfig { vec: &rings }) };
+    let server = server.expect("Have initialized server");
+
+    let shared_client = shared.clone().into_client();
+    let client = shared_client.expect("Have initialized client");
+
+    let tid = ClientIdentifier::new();
+    let join_lhs = client.join(&RingRequest {
+        side: ClientSide::Left,
+        index: RingIndex(0),
+        tid,
+    });
+
+    let lhs = join_lhs.unwrap();
+    drop(lhs);
+
+    assert_eq!(server.bring_up(&rings), 1);
+}
+
+/// We must be able to re-initialize a previously running ring, if both sides have had their
+/// clients die.
+#[test]
+fn reap_at_two_sides() {
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(0x1_000_000).unwrap();
+
+    let map = MmapRaw::map_raw(&file).unwrap();
+    // Fulfills all the pre-conditions of alignment to map.
+    let shared = Shared::new(map).unwrap();
+
+    let rings = [RingConfig {
+        version: RingVersion::default(),
+        ring_size: 0x10,
+        data_size: 0x1234,
+        slot_entry_size: 0x8,
+        lhs: -1,
+        rhs: -1,
+    }];
+
+    let shared_server = shared.clone();
+    let server = unsafe { shared_server.into_server(ServerConfig { vec: &rings }) };
+    let server = server.expect("Have initialized server");
+
+    let shared_client = shared.clone().into_client();
+    let client = shared_client.expect("Have initialized client");
+
+    let tid = ClientIdentifier::new();
+
+    let join_lhs = client.join(&RingRequest {
+        side: ClientSide::Left,
+        index: RingIndex(0),
+        tid,
+    });
+
+    let join_rhs = client.join(&RingRequest {
+        side: ClientSide::Right,
+        index: RingIndex(0),
+        tid,
+    });
+
+    let lhs = join_lhs.unwrap();
+    let rhs = join_rhs.unwrap();
+
+    assert_eq!(server.bring_up(&rings), 0, "Not yet");
+    drop(lhs);
+    assert_eq!(server.bring_up(&rings), 0, "Not yet");
+    drop(rhs);
+    assert_eq!(server.bring_up(&rings), 1);
+}
