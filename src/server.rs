@@ -204,11 +204,33 @@ impl Server {
                 continue;
             };
 
-            if !slot.lhs.is_owned_by_server_as_checked_by_server()
-                || !slot.rhs.is_owned_by_server_as_checked_by_server()
-            {
+            // Ensure that we don't churn the below writes too much.
+            //
+            // Firstly there must not be a client.
+            let Ok(open_lhs) = slot.lhs.is_open_heuristically() else {
+                continue;
+            };
+
+            let Ok(open_rhs) = slot.rhs.is_open_heuristically() else {
+                continue;
+            };
+
+            // Secondly at least one must truly require re-initialization.
+            if open_lhs && open_rhs {
                 continue;
             }
+
+            // FIXME we should decide on the policy here. We might have reset the owner of this
+            // ring from a shared state. Should we then change the new ID to the one which it was
+            // currently shared with, or the one in the configuration? We assume these to be the
+            // same here but that may change in another code path.
+            let Ok(_lhs_update) = slot.lhs.take_for_server() else {
+                continue;
+            };
+
+            let Ok(_rhs_update) = slot.rhs.take_for_server() else {
+                continue;
+            };
 
             let ring_head = self.borrow_ring_head(slot);
             ring_head.reinit_holding_as_server();

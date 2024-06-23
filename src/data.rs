@@ -322,16 +322,33 @@ impl ClientSlot {
         }
     }
 
+    pub(crate) fn is_open_heuristically(&self) -> Result<bool, ClientIdentifier> {
+        match self.owner.load(Ordering::Relaxed) as i32 {
+            n @ 1.. => Err(ClientIdentifier(n as u64)),
+            0 => Ok(false),
+            _ => Ok(true),
+        }
+    }
+
     /// Check if the server is the authority to write to this slot, i.e. if it is `0`.
     ///
     /// On `true`, the server is the only one allowed to turn it false thus this is also a
     /// non-ephemeral answer. After `true` the server can rely on all effects having been seen.
-    pub(crate) fn is_owned_by_server_as_checked_by_server(&self) -> bool {
-        if self.owner.load(Ordering::Relaxed) == 0 {
-            core::sync::atomic::fence(Ordering::Acquire);
-            true
-        } else {
-            false
+    pub(crate) fn take_for_server(&self) -> Result<Option<RingIdentifier>, ClientIdentifier> {
+        // Acquire the ring's head as 0, if it is currently shared.
+        let acquisition =
+            self.owner
+                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |n: u32| {
+                    Some(0).filter(|_| (n as i32) < 0)
+                });
+
+        match acquisition {
+            Ok(id) => Ok(Some(RingIdentifier(id as i32))),
+            Err(0) => Ok(None),
+            Err(id) => {
+                debug_assert!(id > 0);
+                Err(ClientIdentifier(id as u64))
+            }
         }
     }
 

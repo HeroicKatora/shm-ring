@@ -121,14 +121,22 @@ fn main() -> Result<(), Error> {
         panic!("Parser validation failed");
     };
 
-    let file = fs::File::open(config)?;
+    let file = fs::File::open(config).map_err(|err| {
+        eprintln!("Failed to read configuration file {err:?}");
+        err
+    })?;
+
     let options: Options = serde_json::de::from_reader(file)?;
     let opt_path = config.parent().unwrap();
 
     let server = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(server)?;
+        .open(server)
+        .map_err(|err| {
+            eprintln!("Failed to open ring file {err:?}");
+            err
+        })?;
 
     let map = MmapRaw::map_raw(&server).unwrap();
     // Fulfills all the pre-conditions of alignment to map.
@@ -185,15 +193,19 @@ fn new_program(
         stderr,
     } = &options;
 
-    let stdin = join_ring(stdin.as_ref(), client, tid)?;
-    let stdout = join_ring(stdout.as_ref(), client, tid)?;
-    let stderr = join_ring(stderr.as_ref(), client, tid)?;
-
     let module = opt_path.join(module);
     let module = module.canonicalize()?;
 
-    let module = std::fs::read(module)?;
+    let module = std::fs::read(module).map_err(|err| {
+        eprintln!("Failed to read WASM module {err:?}");
+        err
+    })?;
+
     let module = Module::new(&engine, module)?;
+
+    let stdin = join_ring(stdin.as_ref(), client, tid)?;
+    let stdout = join_ring(stdout.as_ref(), client, tid)?;
+    let stderr = join_ring(stderr.as_ref(), client, tid)?;
 
     Ok(Program {
         module,
